@@ -12,6 +12,7 @@ the roadmap. It is meant to outlive any single coding session.
 | [02-tech-stack.md](02-tech-stack.md) | Languages, tools, libraries, testing infra |
 | [03-roadmap.md](03-roadmap.md) | Phased plan with Elo milestones |
 | [04-nnue.md](04-nnue.md) | The NNUE endgame: how neural eval works + training pipeline |
+| [05-board-representation.md](05-board-representation.md) | Deep dive: bitboards + mailbox, and why the layout helps |
 | [decisions/](decisions/) | Architecture Decision Records (ADRs) — the *why* |
 | [resources.md](resources.md) | Curated learning links |
 
