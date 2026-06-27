@@ -5,4 +5,5 @@
 
 pub mod bitboard;
 pub mod board;
+pub mod fen;
 pub mod types;
