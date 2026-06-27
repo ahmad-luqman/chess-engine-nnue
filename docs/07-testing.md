@@ -36,18 +36,21 @@ repo; install it locally.
 
 ### Install (macOS)
 
-cutechess needs Qt, so the simplest routes are:
+Two routes, both SPRT-capable with near-identical flags:
 
-- **Build from source** — clone <https://github.com/cutechess/cutechess>, then
-  build per its README (needs Qt + CMake). The CLI binary is `cutechess-cli`.
-- **fastchess** (easier to build, no Qt; near-identical flags) —
-  <https://github.com/Disservin/fastchess>. A fine substitute everywhere below;
-  swap the binary name and adjust flag spellings per its docs.
+- **fastchess** — easier on macOS (C++/Makefile, **no Qt**); this is what's
+  installed on this dev machine. Clone <https://github.com/Disservin/fastchess>,
+  `make -j`, and put the `fastchess` binary on `PATH` (e.g. symlink it into
+  `/opt/homebrew/bin`). The commands below use fastchess syntax.
+- **cutechess-cli** — the lineage standard (see
+  [ADR 0004](decisions/0004-cutechess-testing.md)), but needs Qt: clone
+  <https://github.com/cutechess/cutechess> and build per its README. Flags match
+  except `-pgnout file=…` becomes `-pgnout …`.
 
-Verify whichever you installed is on `PATH`:
+Verify it's on `PATH`:
 
 ```
-cutechess-cli --version      # or: fastchess --version
+fastchess --version          # or: cutechess-cli --version
 ```
 
 ### A sanity game (two builds, a few games)
@@ -56,17 +59,18 @@ Keep a known-good **baseline** binary as the opponent (a tagged release — see
 below). Then:
 
 ```
-cutechess-cli \
+fastchess \
   -engine cmd=./target/release/engine name=new \
   -engine cmd=./baseline/engine        name=base \
   -each proto=uci tc=10+0.1 \
   -games 2 -rounds 1 \
-  -pgnout sanity.pgn
+  -pgnout file=sanity.pgn
 ```
 
 `tc=10+0.1` is 10 seconds + 0.1s/move. Open `sanity.pgn` and confirm the games
 are legal and complete — that alone is the **Phase 1 (#22) exit check**: the
-engine plays a full legal game via UCI against another engine.
+engine plays a full legal game via UCI against another engine. (First run, the
+engine vs itself, did exactly this: 87 plies ending in checkmate.)
 
 ### The real test: SPRT
 
@@ -74,14 +78,14 @@ SPRT plays games until it can conclude (with bounded error) whether the new buil
 gained Elo, then stops — far more efficient than a fixed N games.
 
 ```
-cutechess-cli \
+fastchess \
   -engine cmd=./target/release/engine name=new \
   -engine cmd=./baseline/engine        name=base \
   -each proto=uci tc=8+0.08 \
   -openings file=book.epd format=epd order=random \
-  -repeat -games 2 -rounds 5000 -concurrency 4 \
+  -repeat -rounds 5000 -games 2 -concurrency 4 \
   -sprt elo0=0 elo1=5 alpha=0.05 beta=0.05 \
-  -pgnout sprt.pgn
+  -pgnout file=sprt.pgn
 ```
 
 - `-repeat -games 2` plays each opening twice with colours reversed (fairness).

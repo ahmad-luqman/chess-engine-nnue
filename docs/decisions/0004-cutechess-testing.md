@@ -38,9 +38,12 @@ close enough that switching later is cheap.
 
 ## Consequences
 
-- A local install of cutechess-cli (and a small opening book) is a developer
+- A local install of a match runner (and a small opening book) is a developer
   prerequisite for measuring strength — see [07-testing.md](../07-testing.md)
-  for install + invocations.
+  for install + invocations. In practice **fastchess** is installed on the dev
+  machine (cutechess needs Qt and isn't packaged for macOS); the flags are
+  near-identical, so this is the sanctioned drop-in, not a reversal of the
+  decision above.
 - The working method becomes concrete: change → `cargo test`/perft (correctness)
   → SPRT vs the previous tagged build (strength) → keep only if it passes.
 - We must keep a **tagged baseline binary** around as the opponent ("tag releases
