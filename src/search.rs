@@ -170,9 +170,9 @@ mod tests {
         let b = board("4k3/8/8/8/3q4/8/8/3RK3 w - - 0 1");
         let result = search(&b, 1);
         assert_eq!(result.best_move.to_string(), "d1d4");
-        // After RxQ the resulting balance is White's lone rook vs nothing: +500.
-        // (The capture nets the queen, but White already had the rook.)
-        assert_eq!(result.score, 500);
+        // After RxQ White is up a rook's worth of material (≈+500); PSTs nudge
+        // the exact number, so just assert a clearly-winning score.
+        assert!(result.score > 400, "expected a winning score, got {}", result.score);
     }
 
     #[test]
