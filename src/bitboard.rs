@@ -43,9 +43,8 @@ impl Bitboard {
 
     /// Is `sq` a member of this set?
     pub fn contains(self, sq: Square) -> bool {
-        // TODO(you): return true iff bit `sq.0` is set.
-        let _ = sq;
-        unimplemented!()
+        // AND with a one-square mask; non-zero iff bit `sq.0` was set.
+        self.0 & (1u64 << sq.0) != 0
     }
 
     /// Return a copy with `sq` added to the set (set the bit).
@@ -54,9 +53,9 @@ impl Bitboard {
     /// mutating (`&mut self`). We use immutable here for composability; you'll
     /// see both styles in real engines.
     pub fn with(self, sq: Square) -> Bitboard {
-        // TODO(you): return a Bitboard equal to self but with bit `sq.0` set.
-        let _ = sq;
-        unimplemented!()
+        // OR in the one-square mask. Idempotent: setting an already-set bit is
+        // a harmless no-op.
+        Bitboard(self.0 | (1u64 << sq.0))
     }
 
     /// Remove and return the least-significant set square (the lowest index),
@@ -66,9 +65,15 @@ impl Bitboard {
     /// walks every piece in a bitboard. Hint: `trailing_zeros` gives the index of
     /// the lowest set bit; `self.0 & (self.0 - 1)` clears it.
     pub fn pop_lsb(&mut self) -> Option<Square> {
-        // TODO(you): if empty return None; else compute the lsb square, clear it
-        // from self, and return Some(square).
-        unimplemented!()
+        // Guard empty FIRST: trailing_zeros() on 0 returns 64 (a bogus square).
+        if self.0 == 0 {
+            return None;
+        }
+        // Index of the lowest set bit (0..=63), then clear that bit with the
+        // `x & (x - 1)` trick (single BLSR instruction).
+        let idx = self.0.trailing_zeros() as u8;
+        self.0 &= self.0 - 1;
+        Some(Square(idx))
     }
 }
 
