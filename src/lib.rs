@@ -5,9 +5,11 @@
 
 pub mod bitboard;
 pub mod board;
+pub mod eval;
 pub mod fen;
 pub mod movegen;
 pub mod moves;
 pub mod perft;
+pub mod search;
 pub mod types;
 pub mod uci;

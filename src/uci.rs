@@ -32,7 +32,12 @@ use std::str::FromStr;
 use crate::board::Board;
 use crate::movegen::generate_legal;
 use crate::moves::Move;
+use crate::search::search;
 use crate::types::{PieceType, Square};
+
+/// Default search depth for a bare `go` (no `depth` argument). Time management
+/// (issue #21) replaces this fixed depth with a real, clock-driven budget.
+const DEFAULT_DEPTH: u32 = 5;
 
 /// The standard starting position, in FEN. Shared shape with `main.rs`'s
 /// `STARTPOS`; duplicated rather than cross-referenced to keep the modules
@@ -78,14 +83,22 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: &mut W) -> io::Result<()
             "ucinewgame" => board = startpos(),
             "position" => set_position(&mut board, tokens),
             "go" => {
-                // Phase 1, issue #18: instant placeholder move. Issue #19 swaps
-                // `choose_move` for a real negamax search reading the `go` args.
-                let best = choose_move(&board);
-                match best {
-                    Some(mv) => writeln!(output, "bestmove {mv}")?,
-                    // UCI's "no move" sentinel: a null move (used for mate /
-                    // stalemate positions) keeps the GUI from hanging.
-                    None => writeln!(output, "bestmove 0000")?,
+                // Search to a fixed depth (issue #19). The only `go` argument we
+                // read so far is `depth N`; the clock arguments (wtime/btime/…)
+                // become a real time budget in issue #21.
+                let depth = parse_go_depth(tokens).unwrap_or(DEFAULT_DEPTH);
+                let result = search(&board, depth);
+                writeln!(
+                    output,
+                    "info depth {} score cp {} nodes {}",
+                    result.depth, result.score, result.nodes
+                )?;
+                if result.best_move == Move::NONE {
+                    // UCI's "no move" sentinel — mate/stalemate; keeps the GUI
+                    // from hanging.
+                    writeln!(output, "bestmove 0000")?;
+                } else {
+                    writeln!(output, "bestmove {}", result.best_move)?;
                 }
             }
             // `stop` halts a running search. Our search is instant, so there is
@@ -210,13 +223,15 @@ fn promo_letter(pt: PieceType) -> Option<u8> {
     }
 }
 
-/// Pick the engine's move for the current position.
-///
-/// Issue #18 placeholder: the first legal move (or `None` at checkmate /
-/// stalemate). This makes the engine play fully legal — if weak — games end to
-/// end through Cute Chess. Issue #19 replaces the body with negamax + alpha-beta.
-fn choose_move(board: &Board) -> Option<Move> {
-    generate_legal(board).into_iter().next()
+/// Scan a `go` command's arguments for `depth N` and return `N`, if present.
+/// Other arguments (clock times, `infinite`, …) are ignored until issue #21.
+fn parse_go_depth<'a, I: Iterator<Item = &'a str>>(mut tokens: I) -> Option<u32> {
+    while let Some(tok) = tokens.next() {
+        if tok == "depth" {
+            return tokens.next().and_then(|d| d.parse::<u32>().ok());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -245,7 +260,7 @@ mod tests {
 
     #[test]
     fn go_from_startpos_plays_a_legal_move() {
-        let out = run("position startpos\ngo\nquit\n");
+        let out = run("position startpos\ngo depth 2\nquit\n");
         let mv = bestmove(&out).expect("a bestmove line");
         let legal: Vec<String> = generate_legal(&startpos()).iter().map(|m| m.to_string()).collect();
         assert!(legal.contains(&mv), "{mv} is not legal from startpos; legal = {legal:?}");
@@ -253,7 +268,7 @@ mod tests {
 
     #[test]
     fn position_applies_moves_then_go_is_legal_in_that_line() {
-        let out = run("position startpos moves e2e4 e7e5\ngo\nquit\n");
+        let out = run("position startpos moves e2e4 e7e5\ngo depth 2\nquit\n");
         let mv = bestmove(&out).expect("a bestmove line");
 
         // Reconstruct the same position and confirm the move is legal there.
@@ -268,11 +283,10 @@ mod tests {
 
     #[test]
     fn position_fen_with_spaces_is_reassembled() {
-        // A FEN spans six space-separated fields; the parser must rejoin them.
-        // This position has only one legal move (Kxa2 — actually let's use a
-        // simple known position) so we just assert we get *some* legal move.
+        // A FEN spans six space-separated fields; the parser must rejoin them
+        // before parsing. We just assert we get some legal move back.
         let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-        let out = run(&format!("position fen {fen}\ngo\nquit\n"));
+        let out = run(&format!("position fen {fen}\ngo depth 2\nquit\n"));
         assert!(bestmove(&out).is_some(), "no bestmove for a fen position: {out:?}");
     }
 
@@ -310,7 +324,7 @@ mod tests {
     fn no_legal_moves_emits_null_move() {
         // Fool's-mate position: Black is checkmated, so `go` has no move to make.
         let fen = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3";
-        let out = run(&format!("position fen {fen}\ngo\nquit\n"));
+        let out = run(&format!("position fen {fen}\ngo depth 2\nquit\n"));
         assert_eq!(bestmove(&out).as_deref(), Some("0000"), "expected null move: {out:?}");
     }
 

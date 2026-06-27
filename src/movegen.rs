@@ -263,9 +263,20 @@ pub fn is_square_attacked(board: &Board, sq: Square, by: Color) -> bool {
 }
 
 /// The square the `color` king stands on. Every legal position has exactly one.
-fn king_square(board: &Board, color: Color) -> Square {
+///
+/// Public because search needs it for mate/stalemate detection, and NNUE
+/// (Phase 4) will want king squares for king-relative features.
+pub fn king_square(board: &Board, color: Color) -> Square {
     let mut kings = board.pieces(PieceType::King).intersect(board.color(color));
     kings.pop_lsb().expect("every position has a king of each color")
+}
+
+/// True if `color`'s king is currently in check — i.e. attacked by the enemy.
+///
+/// Search uses this to tell checkmate (no legal moves *and* in check) from
+/// stalemate (no legal moves, *not* in check).
+pub fn in_check(board: &Board, color: Color) -> bool {
+    is_square_attacked(board, king_square(board, color), color.flip())
 }
 
 /// True if making `mv` on the throwaway `work` board leaves the mover's own king
