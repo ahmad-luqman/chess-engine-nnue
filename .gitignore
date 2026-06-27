@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target/
+
+# Backtraces
+*.bt
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+# Keep .vscode/ out by default; add specific shared files if needed later
+.vscode/
+
+# Engine-specific large/generated assets (added as the project grows)
+# Training data, nets, books, tablebases — keep these out of git history.
+*.nnue
+*.bin
+*.pgn
+*.epd
+/data/
+/nets/

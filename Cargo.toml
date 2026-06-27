@@ -1,0 +1,22 @@
+[package]
+name = "chess-engine-nnue"
+version = "0.1.0"
+edition = "2021"
+description = "A chess engine, built from bitboards up toward NNUE evaluation"
+
+[[bin]]
+name = "engine"
+path = "src/main.rs"
+
+[lib]
+name = "engine"
+path = "src/lib.rs"
+
+# Release profile is what matters for an engine: search speed is everything.
+# We turn on fat LTO and a single codegen unit so the optimizer can see the
+# whole program. `cargo run` (debug) will be ~10-50x slower — always bench in
+# release.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
