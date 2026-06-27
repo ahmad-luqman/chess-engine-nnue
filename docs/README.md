@@ -14,6 +14,7 @@ the roadmap. It is meant to outlive any single coding session.
 | [04-nnue.md](04-nnue.md) | The NNUE endgame: how neural eval works + training pipeline |
 | [05-board-representation.md](05-board-representation.md) | Deep dive: bitboards + mailbox, and why the layout helps |
 | [06-move-generation.md](06-move-generation.md) | Deep dive: move encoding, legal movegen, make/unmake, perft |
+| [07-testing.md](07-testing.md) | Correctness (perft/clippy) + strength (cutechess SPRT) |
 | [decisions/](decisions/) | Architecture Decision Records (ADRs) — the *why* |
 | [resources.md](resources.md) | Curated learning links |
 
