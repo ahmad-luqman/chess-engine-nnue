@@ -20,6 +20,11 @@ impl Color {
             Color::Black => Color::White,
         }
     }
+
+    /// Index 0 (White) or 1 (Black), for indexing per-color arrays.
+    pub fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// The kind of a piece, independent of color.
@@ -31,6 +36,20 @@ pub enum PieceType {
     Rook,
     Queen,
     King,
+}
+
+impl PieceType {
+    /// Index 0..=5 (Pawn..King), for indexing per-piece-type arrays.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// A colored piece: the combination of a color and a kind.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Piece {
+    pub color: Color,
+    pub piece_type: PieceType,
 }
 
 /// A board square, 0..=63 with a1 = 0 and h8 = 63.

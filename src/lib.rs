@@ -4,4 +4,5 @@
 //! perft → search → eval → uci. We are in Phase 0.
 
 pub mod bitboard;
+pub mod board;
 pub mod types;

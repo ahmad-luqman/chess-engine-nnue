@@ -58,6 +58,17 @@ impl Bitboard {
         Bitboard(self.0 | (1u64 << sq.0))
     }
 
+    /// Return a copy with `sq` removed (clear the bit). The mirror of `with`:
+    /// AND with the inverted mask. Idempotent on an already-clear square.
+    pub fn without(self, sq: Square) -> Bitboard {
+        Bitboard(self.0 & !(1u64 << sq.0))
+    }
+
+    /// Set union (bitwise OR) of two bitboards.
+    pub fn union(self, other: Bitboard) -> Bitboard {
+        Bitboard(self.0 | other.0)
+    }
+
     /// Remove and return the least-significant set square (the lowest index),
     /// mutating self to clear it. Returns `None` if empty.
     ///
