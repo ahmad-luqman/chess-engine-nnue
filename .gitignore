@@ -19,3 +19,6 @@
 *.epd
 /data/
 /nets/
+
+# Match-runner (fastchess/cutechess) artifacts written into the working dir.
+/config.json
