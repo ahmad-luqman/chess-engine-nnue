@@ -69,6 +69,20 @@ impl Bitboard {
         Bitboard(self.0 | other.0)
     }
 
+    /// Set intersection (bitwise AND): squares in *both* sets. The move
+    /// generator's workhorse — e.g. `attacks.intersect(enemy)` is "the squares
+    /// this piece attacks that hold an enemy", i.e. its captures.
+    pub fn intersect(self, other: Bitboard) -> Bitboard {
+        Bitboard(self.0 & other.0)
+    }
+
+    /// Set difference (`self` minus `other`): squares in `self` but not `other`.
+    /// The other movegen staple — `attacks.minus(own)` drops moves onto one's
+    /// own pieces, since a piece can never capture its own side.
+    pub fn minus(self, other: Bitboard) -> Bitboard {
+        Bitboard(self.0 & !other.0)
+    }
+
     /// Remove and return the least-significant set square (the lowest index),
     /// mutating self to clear it. Returns `None` if empty.
     ///
@@ -103,6 +117,18 @@ mod tests {
         assert!(bb.contains(sq(63)));
         assert!(!bb.contains(sq(1)));
         assert_eq!(bb.count(), 2);
+    }
+
+    #[test]
+    fn intersect_and_minus() {
+        let a = Bitboard::EMPTY.with(sq(0)).with(sq(1)).with(sq(2));
+        let b = Bitboard::EMPTY.with(sq(1)).with(sq(2)).with(sq(3));
+        // Intersection keeps only the shared squares 1 and 2.
+        assert_eq!(a.intersect(b), Bitboard::EMPTY.with(sq(1)).with(sq(2)));
+        // Difference keeps a's squares not in b: just 0.
+        assert_eq!(a.minus(b), Bitboard::EMPTY.with(sq(0)));
+        // minus is not symmetric: b's exclusive square is 3.
+        assert_eq!(b.minus(a), Bitboard::EMPTY.with(sq(3)));
     }
 
     #[test]

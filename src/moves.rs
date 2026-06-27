@@ -191,6 +191,12 @@ impl Move {
         self.flag().is_castle()
     }
 
+    /// True for the king-side castle specifically (see
+    /// [`MoveFlag::is_king_castle`]).
+    pub fn is_king_castle(self) -> bool {
+        self.flag().is_king_castle()
+    }
+
     /// The promoted-to piece, or `None` (see [`MoveFlag::promotion_piece`]).
     pub fn promotion_piece(self) -> Option<PieceType> {
         self.flag().promotion_piece()
