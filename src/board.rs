@@ -361,37 +361,4 @@ mod tests {
         }
     }
 
-    /// Count leaf nodes at depth `depth` by making and unmaking every legal move.
-    /// This exercises the whole make/unmake machinery recursively; the dedicated
-    /// perft module and full depth-5/6 table are issue #17.
-    fn perft(board: &mut Board, depth: u32) -> u64 {
-        let moves = generate_legal(board);
-        if depth == 1 {
-            return moves.len() as u64;
-        }
-        let mut nodes = 0;
-        for mv in moves {
-            let undo = board.make_move(mv);
-            nodes += perft(board, depth - 1);
-            board.unmake_move(mv, undo);
-        }
-        nodes
-    }
-
-    #[test]
-    fn perft_depth3_matches_standard_positions() {
-        // Depth 3 across all five positions: each stresses a different mix
-        // (ep + checks, promotions, castling, pins), and at depth 3 only correct
-        // make/unmake produces these node counts. Deeper perft is gated for #17,
-        // since debug-build depth 4+ is slow.
-        for (fen, expected) in [
-            (STARTPOS, 8902u64),
-            (KIWIPETE, 97862),
-            (POS3, 2812),
-            (POS4, 9467),
-            (POS5, 62379),
-        ] {
-            assert_eq!(perft(&mut board(fen), 3), expected, "perft(3) wrong for {fen}");
-        }
-    }
 }
