@@ -18,7 +18,7 @@
 use crate::bitboard::Bitboard;
 use crate::board::{Board, CastlingRights};
 use crate::moves::{Move, MoveFlag};
-use crate::types::{Color, Piece, PieceType, Square};
+use crate::types::{Color, PieceType, Square};
 
 // ── Non-sliding attack tables (knight, king, pawn) ──────────────────────────
 //
@@ -268,55 +268,14 @@ fn king_square(board: &Board, color: Color) -> Square {
     kings.pop_lsb().expect("every position has a king of each color")
 }
 
-/// Apply `mv` to a clone of `board` *only far enough to test king safety*: the
-/// moving piece (and the castled rook / en-passant victim) are relocated, but the
-/// side to move, castling rights, ep square, and clocks are deliberately left
-/// untouched — none of them change whether the mover's king is now attacked. The
-/// full, reversible make/unmake with state bookkeeping is issue #16.
-fn apply_light(board: &Board, mv: Move) -> Board {
-    let mut b = board.clone();
-    let us = board.side_to_move;
-    let from = mv.from();
-    let to = mv.to();
-
-    let moving = b.remove_piece(from).expect("a move originates on an occupied square");
-    if mv.is_en_passant() {
-        // The captured pawn stands beside the mover — destination file, origin
-        // rank — never on `to` itself. This is exactly the #14 distinction.
-        let victim = Square::from_file_rank(to.file(), from.rank());
-        b.remove_piece(victim);
-    } else {
-        // Ordinary capture: clear whatever stood on `to` (a no-op if empty).
-        b.remove_piece(to);
-    }
-
-    let placed = match mv.promotion_piece() {
-        Some(piece_type) => Piece { color: us, piece_type },
-        None => moving,
-    };
-    b.put_piece(to, placed);
-
-    if mv.is_castle() {
-        // The king's own move is already done; bring the rook to its other side.
-        let rank = from.rank();
-        let (rook_from, rook_to) = if mv.is_king_castle() {
-            (Square::from_file_rank(7, rank), Square::from_file_rank(5, rank))
-        } else {
-            (Square::from_file_rank(0, rank), Square::from_file_rank(3, rank))
-        };
-        let rook = b.remove_piece(rook_from).expect("a castling rook is present");
-        b.put_piece(rook_to, rook);
-    }
-
-    b
-}
-
-/// True if making `mv` leaves the mover's own king unattacked — the legality
-/// test every pseudo-legal move must pass.
-fn leaves_king_safe(board: &Board, mv: Move) -> bool {
-    let us = board.side_to_move;
-    let after = apply_light(board, mv);
-    !is_square_attacked(&after, king_square(&after, us), us.flip())
+/// True if making `mv` on the throwaway `work` board leaves the mover's own king
+/// unattacked. `work` is mutated and restored in place via make/unmake, so the
+/// whole legality filter needs just one board clone for an entire position.
+fn leaves_king_safe(work: &mut Board, us: Color, mv: Move) -> bool {
+    let undo = work.make_move(mv);
+    let safe = !is_square_attacked(work, king_square(work, us), us.flip());
+    work.unmake_move(mv, undo);
+    safe
 }
 
 /// Append a non-pawn piece's moves from `from` to `targets` (already masked free
@@ -501,8 +460,10 @@ pub fn generate_legal(board: &Board) -> Vec<Move> {
     let king = king_square(board, us);
     add_target_moves(king, king_attacks(king).minus(own), enemy, &mut moves);
 
-    // Filter the pseudo-legal moves down to the legal ones...
-    moves.retain(|&mv| leaves_king_safe(board, mv));
+    // Filter the pseudo-legal moves down to the legal ones, reusing one working
+    // copy across all of them (make/unmake in place, no per-move clone)...
+    let mut work = board.clone();
+    moves.retain(|&mv| leaves_king_safe(&mut work, us, mv));
     // ...then add castling, which was validated as legal during generation.
     generate_castling(board, us, occupied, &mut moves);
 
@@ -715,13 +676,17 @@ mod tests {
     #[test]
     fn king_in_check_must_respond() {
         // Black king e8 in check from a white rook on e1 down the open e-file.
-        // Every legal move must end the check (none may leave the king on e8's
-        // file under attack); a few escape squares exist.
+        // Every generated move must genuinely end the check: re-apply it and
+        // confirm the black king is no longer attacked.
         let b = board("4k3/8/8/8/8/8/8/4R1K1 b - - 0 1");
         let moves = generate_legal(&b);
         assert!(!moves.is_empty());
+        let mut work = b.clone();
         for &mv in &moves {
-            assert!(leaves_king_safe(&b, mv), "{mv} leaves the king in check");
+            assert!(
+                leaves_king_safe(&mut work, Color::Black, mv),
+                "{mv} leaves the king in check"
+            );
         }
     }
 
