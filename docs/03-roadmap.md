@@ -3,7 +3,9 @@
 Phased plan. Each phase ends in a *playable, testable* milestone. Elo figures
 are rough order-of-magnitude targets, not promises.
 
-> **Current phase: 0 — Board representation**
+> **Current phase: 1 — Search + eval + UCI.** Phase 0 complete: perft matches
+> published counts for start/Kiwipete/positions 3–5 to depth 5–6 (see
+> [06-move-generation.md](06-move-generation.md)).
 
 | Phase | Goal | Deliverable | Rough Elo |
 |-------|------|-------------|-----------|
@@ -14,19 +16,19 @@ are rough order-of-magnitude targets, not promises.
 | **4** | Replace eval with **NNUE** | A modern engine | ~3200+ |
 | **5** | Lazy SMP, search tuning, SPRT grind, own NNUE training | "Serious engine" | ↑ |
 
-## Phase 0 — detailed checklist (current)
+## Phase 0 — detailed checklist (complete)
 
-- [ ] Core types: `Color`, `PieceType`, `Piece`, `Square`, `Bitboard`
-- [ ] Board struct: piece bitboards + occupancy + mailbox + state
+- [x] Core types: `Color`, `PieceType`, `Piece`, `Square`, `Bitboard`
+- [x] Board struct: piece bitboards + occupancy + mailbox + state
       (side to move, castling rights, ep square, halfmove clock)
-- [ ] FEN parsing (set up arbitrary positions)
-- [ ] Attack tables: knight, king (precomputed); pawns
-- [ ] Sliding attacks: start simple (ray loops), magics later
-- [ ] Move encoding (pack from/to/flags into a compact int)
-- [ ] Legal move generation
-- [ ] make / unmake with undo stack
-- [ ] **Perft** — match published node counts for standard positions
-- [ ] Perft test suite wired into `cargo test`
+- [x] FEN parsing (set up arbitrary positions)
+- [x] Attack tables: knight, king (precomputed); pawns
+- [x] Sliding attacks: start simple (ray loops), magics later
+- [x] Move encoding (pack from/to/flags into a compact int)
+- [x] Legal move generation
+- [x] make / unmake with undo stack
+- [x] **Perft** — match published node counts for standard positions
+- [x] Perft test suite wired into `cargo test`
 
 ### Phase 0 exit criterion
 `perft` matches the known values for at least these positions, to depth 5–6:
