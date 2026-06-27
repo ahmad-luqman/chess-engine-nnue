@@ -28,16 +28,16 @@
 
 use std::io::{self, BufRead, Write};
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::board::Board;
 use crate::movegen::generate_legal;
 use crate::moves::Move;
-use crate::search::search;
+use crate::search::{search_timed, SearchResult, MATE};
+use crate::timeman::{self, Limits};
 use crate::types::{PieceType, Square};
-
-/// Default search depth for a bare `go` (no `depth` argument). Time management
-/// (issue #21) replaces this fixed depth with a real, clock-driven budget.
-const DEFAULT_DEPTH: u32 = 5;
 
 /// The standard starting position, in FEN. Shared shape with `main.rs`'s
 /// `STARTPOS`; duplicated rather than cross-referenced to keep the modules
@@ -83,16 +83,26 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: &mut W) -> io::Result<()
             "ucinewgame" => board = startpos(),
             "position" => set_position(&mut board, tokens),
             "go" => {
-                // Search to a fixed depth (issue #19). The only `go` argument we
-                // read so far is `depth N`; the clock arguments (wtime/btime/…)
-                // become a real time budget in issue #21.
-                let depth = parse_go_depth(tokens).unwrap_or(DEFAULT_DEPTH);
-                let result = search(&board, depth);
-                writeln!(
-                    output,
-                    "info depth {} score cp {} nodes {}",
-                    result.depth, result.score, result.nodes
-                )?;
+                // Turn the `go` arguments into a time budget, then run iterative
+                // deepening until that budget is spent (issue #21). `now` is the
+                // shared origin for both the budget's deadline and the search's
+                // own elapsed-time clock.
+                let limits = parse_go(tokens);
+                let now = Instant::now();
+                let budget = timeman::allocate(&limits, board.side_to_move, now);
+                let stop = Arc::new(AtomicBool::new(false));
+
+                // Stream an `info` line after each completed depth. Write errors
+                // here are non-fatal (the final bestmove write below surfaces a
+                // broken pipe), so we swallow them to keep the closure simple.
+                let result = {
+                    let out = &mut *output;
+                    let mut on_depth = |r: &SearchResult, elapsed: Duration| {
+                        let _ = write_info(out, r, elapsed);
+                    };
+                    search_timed(&board, &budget, stop, now, &mut on_depth)
+                };
+
                 if result.best_move == Move::NONE {
                     // UCI's "no move" sentinel — mate/stalemate; keeps the GUI
                     // from hanging.
@@ -101,9 +111,11 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: &mut W) -> io::Result<()
                     writeln!(output, "bestmove {}", result.best_move)?;
                 }
             }
-            // `stop` halts a running search. Our search is instant, so there is
-            // nothing to halt yet — issue #21 makes this meaningful once search
-            // runs on its own thread with a stop flag.
+            // `stop` asks the engine to stop searching and move now. Phase 1
+            // search is synchronous — while it runs we aren't reading input, so a
+            // `stop` can only arrive *after* the search already finished and
+            // replied. It is therefore a no-op for now; honouring it mid-search
+            // needs the search on its own thread (deferred past Phase 1).
             "stop" => {}
             "quit" => break,
             // Unknown command: the spec says ignore it, do not error.
@@ -223,15 +235,61 @@ fn promo_letter(pt: PieceType) -> Option<u8> {
     }
 }
 
-/// Scan a `go` command's arguments for `depth N` and return `N`, if present.
-/// Other arguments (clock times, `infinite`, …) are ignored until issue #21.
-fn parse_go_depth<'a, I: Iterator<Item = &'a str>>(mut tokens: I) -> Option<u32> {
+/// Parse a `go` command's arguments into [`Limits`]. Each keyword that takes a
+/// value consumes the following token; flags like `infinite` stand alone.
+/// Unknown keywords are skipped, so partial/extended `go` lines don't break us.
+fn parse_go<'a, I: Iterator<Item = &'a str>>(mut tokens: I) -> Limits {
+    let mut limits = Limits::default();
     while let Some(tok) = tokens.next() {
-        if tok == "depth" {
-            return tokens.next().and_then(|d| d.parse::<u32>().ok());
+        match tok {
+            "wtime" => limits.wtime = tokens.next().and_then(|t| t.parse().ok()),
+            "btime" => limits.btime = tokens.next().and_then(|t| t.parse().ok()),
+            "winc" => limits.winc = tokens.next().and_then(|t| t.parse().ok()),
+            "binc" => limits.binc = tokens.next().and_then(|t| t.parse().ok()),
+            "movestogo" => limits.movestogo = tokens.next().and_then(|t| t.parse().ok()),
+            "movetime" => limits.movetime = tokens.next().and_then(|t| t.parse().ok()),
+            "depth" => limits.depth = tokens.next().and_then(|t| t.parse().ok()),
+            "infinite" => limits.infinite = true,
+            _ => {}
         }
     }
-    None
+    limits
+}
+
+/// Write one UCI `info` line summarising a completed search depth: depth, score
+/// (centipawns or mate distance), nodes, nps, elapsed time, and the principal
+/// variation (just the best move for now).
+fn write_info<W: Write>(output: &mut W, r: &SearchResult, elapsed: Duration) -> io::Result<()> {
+    let ms = elapsed.as_millis() as u64;
+    let nps = if ms > 0 { r.nodes * 1000 / ms } else { r.nodes };
+    writeln!(
+        output,
+        "info depth {} score {} nodes {} nps {} time {} pv {}",
+        r.depth,
+        format_score(r.score),
+        r.nodes,
+        nps,
+        ms,
+        r.best_move
+    )
+}
+
+/// Format a score for an `info` line. Normal scores are `cp <centipawns>`; scores
+/// near ±[`MATE`] are reported as `mate <moves>` (positive = we deliver mate in
+/// N moves, negative = we get mated in N), which is how GUIs expect to see them.
+fn format_score(score: i32) -> String {
+    // A score within this margin of MATE encodes a forced mate `MATE - score`
+    // plies away. The margin comfortably exceeds any real positional score.
+    const MATE_THRESHOLD: i32 = MATE - 1000;
+    if score.abs() >= MATE_THRESHOLD {
+        let plies_to_mate = MATE - score.abs();
+        // Convert plies to moves, rounding up (a mate delivered on our move is
+        // "mate 1" at 1 ply), and carry the sign of the score.
+        let moves = (plies_to_mate + 1) / 2;
+        format!("mate {}", moves * score.signum())
+    } else {
+        format!("cp {score}")
+    }
 }
 
 #[cfg(test)]
