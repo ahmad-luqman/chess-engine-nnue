@@ -1,11 +1,12 @@
 //! Engine binary entry point.
 //!
-//! Eventually this runs the UCI loop (Phase 1). For now it exposes `perft`, the
-//! Phase 0 correctness/benchmark tool — the only thing worth running from the
-//! binary before search exists. Per the iron rules, perft numbers are only
-//! meaningful in `--release`.
+//! With no arguments (or `uci`) it runs the **UCI loop** — the engine's normal
+//! mode, the way Cute Chess and other managers drive it. The `perft` subcommand
+//! is kept as the Phase 0 correctness/benchmark tool. Per the iron rules, perft
+//! numbers are only meaningful in `--release`.
 //!
 //! ```text
+//! cargo run --release                            # UCI loop (stdin/stdout)
 //! cargo run --release -- perft 6                 # startpos to depth 6
 //! cargo run --release -- perft 5 "<FEN>"         # any position
 //! ```
@@ -23,10 +24,18 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("perft") => run_perft(&args[2..]),
-        _ => {
-            println!("chess-engine-nnue — Phase 0 (board representation).");
-            println!("Usage: perft <depth> [fen]   (run in --release)");
-            ExitCode::SUCCESS
+        // Default mode (no args) and an explicit `uci` both enter the protocol
+        // loop. A GUI launches the bare binary and speaks UCI immediately.
+        None | Some("uci") => match engine::uci::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("uci: I/O error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(other) => {
+            eprintln!("unknown subcommand {other:?}; expected `uci` or `perft`");
+            ExitCode::FAILURE
         }
     }
 }
