@@ -82,7 +82,7 @@ fastchess \
   -engine cmd=./target/release/engine name=new \
   -engine cmd=./baseline/engine        name=base \
   -each proto=uci tc=8+0.08 \
-  -openings file=book.epd format=epd order=random \
+  -openings file=books/openings.epd format=epd order=random \
   -repeat -rounds 5000 -games 2 -concurrency 4 \
   -sprt elo0=0 elo1=5 alpha=0.05 beta=0.05 \
   -pgnout file=sprt.pgn
@@ -92,9 +92,19 @@ fastchess \
 - `-sprt elo0=0 elo1=5` tests "no gain" vs "≥5 Elo gain" at 5% error each way —
   a typical bar for a small improvement. The run ends when a hypothesis is
   accepted.
-- `-openings` needs a small opening book (an `.epd`/`.pgn` of start positions) so
-  games aren't all the same line; grab any standard book (e.g. a Pohl/8-moves
-  EPD) and point `file=` at it.
+- `-openings` needs an opening book (an `.epd`/`.pgn` of start positions) so
+  games aren't all the same line. We commit a curated one at
+  [`books/openings.epd`](../books/openings.epd) — ~24 balanced mainlines spanning
+  1.e4 / 1.d4 / 1.c4 / 1.Nf3 (issue #31). With `-repeat -games 2` each is played
+  once from each side, so any small opening imbalance cancels. Regenerate it (to
+  add or curate lines, edit `OPENINGS` in `examples/genbook.rs` first) with:
+
+  ```
+  cargo run --release --example genbook > books/openings.epd
+  ```
+
+  The generator plays each line through the engine's own `generate_legal`, so an
+  illegal or mistyped move panics by name rather than emitting a bad position.
 - `-concurrency` to taste (≈ physical cores); strength is independent of it.
 
 ## The working method (every change, Phase 1+)

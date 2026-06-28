@@ -17,6 +17,9 @@
 *.bin
 *.pgn
 *.epd
+# …but the curated SPRT opening book is committed (issue #31); allowlist it.
+# This negation must stay after `*.epd` — later patterns win.
+!/books/openings.epd
 /data/
 /nets/
 

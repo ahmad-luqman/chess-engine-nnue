@@ -232,7 +232,11 @@ fn apply_moves<'a, I: Iterator<Item = &'a str>>(
 /// legal moves and find the one whose `from`/`to` match — and, for the 4-char
 /// promotions, whose promoted piece matches the trailing letter. Whether the
 /// move is a capture, castle, or en-passant is then already encoded correctly.
-fn parse_uci_move(board: &Board, s: &str) -> Option<Move> {
+///
+/// `pub` so tooling outside the protocol loop can replay coordinate move-lists
+/// through the same legal-move matcher — e.g. the opening-book generator
+/// (`examples/genbook.rs`, issue #31) plays curated lines this way.
+pub fn parse_uci_move(board: &Board, s: &str) -> Option<Move> {
     // A UCI move is 4 chars (from+to) or 5 (… + promotion piece).
     if s.len() != 4 && s.len() != 5 {
         return None;
