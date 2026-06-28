@@ -279,4 +279,53 @@ in a fixed-depth engine.
 
 ---
 
-*The draw-detection (#28) section lands with that issue.*
+## 5. Draw detection — repetition & fifty-move (`src/search.rs`, issue #28)
+
+Without draw rules the engine has two blind spots: it shuffles forever in
+dead-drawn endgames (it never sees that repeating is a draw), and it can't tell
+that a line is *not* winning. Phase 2 closes both by scoring **threefold
+repetition** and the **fifty-move rule** as draws (0).
+
+### Repetition
+
+A position has repeated if its Zobrist key matches one seen earlier in the line.
+We keep a stack of ancestor keys — seeded from the game history the GUI sends via
+`position … moves`, then pushed/popped along the search path — and at each node
+check whether the current key appears in it. Two refinements:
+
+- **Only scan back `halfmove_clock` plies.** A pawn move or capture is
+  irreversible and resets the clock, so no position before it can recur; scanning
+  further is wasted and wrong.
+- **A single in-tree repeat counts as a draw.** Strictly the game rule is
+  *threefold*, but inside the search one repetition is enough to recognize the
+  line is going nowhere and stop pursuing it.
+
+The repetition check runs **before the TT probe**: a repetition is a property of
+the *path*, not the position, so a TT score stored on a non-repeating path must
+not be allowed to mask it.
+
+### Fifty-move rule
+
+If `halfmove_clock` reaches 100 plies (50 full moves with no pawn move or
+capture), the position is a draw — but **checkmate takes precedence**: a mate
+delivered on the 50th move is a mate, not a draw. So the fifty-move check comes
+*after* generating moves and finding the node is not terminal, and the TT cut is
+suppressed at the boundary (the clock isn't part of the key, so a cached score
+could otherwise hide the draw).
+
+### Where the history lives
+
+The issue sketched a key stack on `Board`, but `Board` is a deliberately *pure
+value* (it derives `Clone`/`Eq` and is cloned per search). Hanging a growing,
+per-game `Vec` off it would muddy that and make every clone copy the history. So
+the stack lives on the **search context** instead, seeded from the game history —
+see [ADR 0007](decisions/0007-repetition-history.md). `Board` stays clean; make
+/unmake are untouched.
+
+### What it buys
+
+Self-play stops shuffling drawn endgames to the move cap — games end as proper
+draws — and the engine no longer keeps "winning" a position it's actually just
+repeating. It's primarily a correctness fix (SPRT target: non-regression), though
+recognizing repetitions also helps it convert won endgames instead of stumbling
+into a draw.
