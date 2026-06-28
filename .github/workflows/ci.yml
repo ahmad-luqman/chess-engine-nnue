@@ -21,7 +21,7 @@ jobs:
     name: fmt · clippy · test · release build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install stable Rust (rustfmt + clippy)
         uses: dtolnay/rust-toolchain@stable
