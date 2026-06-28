@@ -29,7 +29,14 @@
 //! different move order can reuse the stored score (an immediate cutoff when it
 //! was searched deep enough) instead of being re-searched. The table is borrowed
 //! by the search so it persists across iterative-deepening iterations and, via
-//! UCI, across moves. Move ordering and quiescence come next in Phase 2.
+//! UCI, across moves.
+//!
+//! **Move ordering (issue #25).** Moves are searched best-first — TT move, then
+//! captures by MVV-LVA, killers, and history — so beta cutoffs fire early; this
+//! is the single biggest practical search speedup.
+//!
+//! **Quiescence (issue #26).** At the leaves [`qsearch`] keeps resolving captures
+//! until the position is quiet before evaluating, removing the horizon effect.
 
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -440,7 +447,8 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
     }
 
     if depth == 0 {
-        return ctx.evaluator.evaluate(board);
+        // Resolve pending captures before evaluating, so the leaf is quiet.
+        return qsearch(board, ctx, alpha, beta, ply);
     }
 
     let side = board.side_to_move;
@@ -478,6 +486,61 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
     // Upper bound (every move failed low). Cache it with the best move found.
     let bound = if alpha > alpha_orig { Bound::Exact } else { Bound::Upper };
     ctx.tt.store(board.hash, best_move, score_to_tt(alpha, ply), depth as u8, bound);
+
+    alpha
+}
+
+/// Quiescence search (issue #26): from a leaf, keep resolving captures and
+/// promotions until the position is "quiet", then evaluate. Fixed-depth search
+/// otherwise stops mid-exchange — the *horizon effect* — scoring a position as if
+/// a half-finished capture sequence were over (v0.1.0's startpos score swings
+/// ~100cp between even and odd depths for exactly this reason).
+///
+/// The key idea is the **stand-pat** baseline: the side to move is not obliged to
+/// capture, so its static eval is a floor. If even that floor beats `beta` we cut;
+/// otherwise we try captures, hoping to raise alpha. Because captures strictly
+/// reduce material, the recursion is finite; a `ply` cap guards pathological lines.
+fn qsearch(board: &mut Board, ctx: &mut SearchContext<'_>, mut alpha: i32, beta: i32, ply: i32) -> i32 {
+    ctx.nodes += 1;
+    if ctx.should_stop() {
+        return 0; // value ignored: the caller discards aborted iterations.
+    }
+
+    // Stand-pat: not being forced to capture is the baseline. A fail-high here is
+    // the common case (most positions are fine as they stand).
+    let stand_pat = ctx.evaluator.evaluate(board);
+    if stand_pat >= beta {
+        return beta;
+    }
+    if stand_pat > alpha {
+        alpha = stand_pat;
+    }
+    // Safety cap: never recurse past the killer/ply tables' bound.
+    if ply >= MAX_PLY as i32 {
+        return alpha;
+    }
+
+    // Only captures and promotions — the moves that change material and so could
+    // overturn the stand-pat score. Ordered by MVV-LVA (no TT move or killers in
+    // quiescence; history is irrelevant to captures).
+    let mut moves: Vec<Move> = generate_legal(board).into_iter().filter(|&m| is_tactical(m)).collect();
+    order_moves(&mut moves, board, Move::NONE, &[Move::NONE; 2], &ctx.history, board.side_to_move);
+
+    for mv in moves {
+        let undo = board.make_move(mv);
+        let score = -qsearch(board, ctx, -beta, -alpha, ply + 1);
+        board.unmake_move(mv, undo);
+
+        if ctx.aborted {
+            return alpha;
+        }
+        if score >= beta {
+            return beta;
+        }
+        if score > alpha {
+            alpha = score;
+        }
+    }
 
     alpha
 }
@@ -645,6 +708,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Quiescence search (issue #26) ───────────────────────────────────────
+
+    #[test]
+    fn quiescence_keeps_the_startpos_score_stable_across_depths() {
+        // The horizon effect: without quiescence, fixed-depth eval of the start
+        // position swings ~100cp between even and odd depths, because a leaf can
+        // land mid-pawn-trade. With qsearch every leaf is quiet, so the score
+        // stays small and steady — no even/odd alternation.
+        let b = board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        for depth in 2..=5 {
+            let s = search(&b, depth).score;
+            assert!(s.abs() < 60, "startpos score at depth {depth} should be near 0, got {s}");
+        }
+    }
+
+    #[test]
+    fn quiescence_does_not_grab_a_defended_pawn() {
+        // Equal material (2 pawns each). White's only capture, bxc6, is met by
+        // d7xc6 — an even trade. At depth 1 that recapture sits *past* the leaf,
+        // so without quiescence white would score bxc6 as a won pawn (~+100).
+        // Quiescence plays the recapture out, so the position stays ~even.
+        let b = board("4k3/3p4/2p5/1P6/3P4/8/8/4K3 w - - 0 1");
+        let s = search(&b, 1).score;
+        assert!(s.abs() < 80, "a defended-pawn grab should not look winning, got {s}");
     }
 
     #[test]
