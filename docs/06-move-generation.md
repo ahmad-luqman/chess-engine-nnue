@@ -93,10 +93,35 @@ must be off-board, not h-file of the rank below. Every builder guards it by
 computing target file/rank as signed integers and discarding anything outside
 `0..8`.
 
-> Today sliders use simple ray loops — correct but O(squares-per-ray). Phase 2
-> replaces them with **magic bitboards** (one multiply + one table lookup) once
-> perft has proven the simple version correct. "Correct first, fast later" is an
-> iron rule, not a preference.
+> **Update (Phase 2, issue #27):** sliders now use **magic bitboards** — one
+> multiply + one table lookup — replacing the ray loop. The ray loop survives as
+> `ray_attacks`: it's the *oracle* the magic tables are built and verified
+> against. The public `rook_attacks`/`bishop_attacks` signatures are unchanged,
+> so `is_square_attacked` and `generate_legal` were untouched, and perft node
+> counts are identical (the gate). See the section below and
+> [ADR 0008](decisions/0008-magic-bitboards.md).
+
+#### Magic bitboards (the fast slider path)
+
+A slider's reach depends on blockers, so it can't be a plain per-square table.
+The magic trick: for a square, only the ray squares *between* it and the board
+edge can block it (the **relevant mask** — the edge square's occupancy never
+matters). A carefully chosen **magic** multiplier maps each masked occupancy to a
+table index:
+
+```
+attacks = TABLE[sq][ ((occupied & mask[sq]) * magic[sq]) >> shift[sq] ]
+```
+
+Different occupancies may collide on an index *as long as they share the same
+attack set* (a harmless collision) — that's what makes the tables compact (≤ 2¹²
+entries per rook square).
+
+We **find** the magics at first use with a fixed-seed PRNG rather than hard-coding
+published constants, and verify every candidate against `ray_attacks` for all
+occupancy subsets before accepting it — so the tables are correct by construction,
+not by trusting a transcribed constant. Build cost is a few ms, once, behind a
+`OnceLock` (`src/magic.rs`).
 
 ### `is_square_attacked` — running the tables backwards
 
@@ -241,9 +266,9 @@ cargo run  --release -- perft 6                # the binary's perft CLI
   loop is exactly the perft loop with evaluation and pruning bolted on.
 - **Move ordering (Phase 2)** reads the flag bits for free — captures and promotions
   (the high-value moves) are a bitmask away, no recomputation.
-- **Speed (Phase 2)** swaps ray-loop sliders for magic bitboards and may move to a
-  staged/fully-legal generator; perft is the regression test that keeps the
-  rewrite honest.
+- **Speed (Phase 2)** swapped ray-loop sliders for **magic bitboards** (done,
+  issue #27 — see above), with perft as the regression test that kept the rewrite
+  honest; a staged/fully-legal generator may still come later.
 - **NNUE (Phase 4)** hooks its accumulator update into make/unmake, which already
   expresses change at exactly the `(piece, square)` granularity the network needs.
 
