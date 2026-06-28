@@ -15,6 +15,7 @@ the roadmap. It is meant to outlive any single coding session.
 | [05-board-representation.md](05-board-representation.md) | Deep dive: bitboards + mailbox, and why the layout helps |
 | [06-move-generation.md](06-move-generation.md) | Deep dive: move encoding, legal movegen, make/unmake, perft |
 | [07-testing.md](07-testing.md) | Correctness (perft/clippy) + strength (cutechess SPRT) |
+| [08-search-internals.md](08-search-internals.md) | Deep dive: Zobrist, TT, move ordering, quiescence, draw detection (Phase 2) |
 | [decisions/](decisions/) | Architecture Decision Records (ADRs) — the *why* |
 | [resources.md](resources.md) | Curated learning links |
 
