@@ -170,5 +170,55 @@ measurable Elo is smaller and noisier — expected from splitting #24 and #25.
 
 ---
 
-*Sections for move ordering (#25), quiescence (#26), and draw detection (#28)
-land with those issues.*
+## 3. Move ordering — searching the best move first (`src/search.rs`, issue #25)
+
+Alpha-beta's entire payoff is conditional on **move order**. A beta cutoff fires
+the moment one move proves good enough to refute the line; if that move is first,
+the node costs one child instead of all of them. With perfect ordering the tree
+shrinks from `b^d` toward `b^(d/2)` — the difference between depth 4 and depth 8
+for the same work. Phase 1 searched moves in generation order (arbitrary); this
+issue scores them.
+
+### The ordering, by band
+
+Each move gets a score and we search highest first. The bands, top to bottom:
+
+1. **TT move** — the best move stored for *this position* (ADR 0006). It's the
+   strongest single signal: in iterative deepening it's the move that was best one
+   ply shallower, almost always still best. Searching it first at the root is the
+   biggest practical speedup in the whole engine.
+2. **Captures & promotions, by MVV-LVA** — *Most Valuable Victim − Least Valuable
+   Attacker*. `PxQ` before `QxQ`: grabbing the queen with a pawn is both more
+   profitable and risks less, so it's the likelier refutation. Scored
+   `victim·16 − attacker` (+ the promoted-piece value for promotions).
+3. **Killer moves** — two *quiet* moves per ply that recently caused a beta
+   cutoff. A move that refuted one line at this depth often refutes its siblings
+   (a sibling threat, a recapture square), even though it captures nothing.
+4. **History heuristic** — a `[from][side][to]` table incremented by `depth²` on
+   every quiet cutoff. It's the global, position-independent tiebreak among the
+   remaining quiets: moves that have been good *somewhere* are tried earlier
+   *everywhere*.
+
+The bands are spaced far apart (TT ≫ captures ≫ killers ≫ history) and the
+history score is clamped below the killer band, so no in-band value can ever
+outrank a higher band.
+
+### Why it doesn't change the result
+
+Ordering only changes *what order* moves are tried, never *which* score the node
+returns — alpha-beta gives the same value for any ordering. So the correctness
+tests assert the chosen move and the tactical/mate scores are unchanged; only the
+node count drops. Killers and history are reset each search; history accumulates
+across a search's iterative-deepening iterations.
+
+### What it buys
+
+Everything the TT (#24) set up now pays off. On Kiwipete to a fixed depth 7 the
+ordered search finishes in ~1 second (~1.1M nodes); v0.1.0, searching in
+generation order, doesn't finish depth 7 in two minutes. In a game that extra
+reachable depth is the strength gain — and it's what finally makes the Phase 2
+SPRT against v0.1.0 decisive.
+
+---
+
+*Sections for quiescence (#26) and draw detection (#28) land with those issues.*
