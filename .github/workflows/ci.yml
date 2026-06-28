@@ -1,0 +1,51 @@
+name: CI
+
+# Run the correctness + lint gate on every push to main and on PRs. Note what is
+# *not* here: SPRT matches and criterion benches are too slow and too
+# timing-sensitive for CI, so they stay local (see issues #33, #30).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel an in-progress run when a new commit is pushed to the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test · release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Formatting: rustfmt.toml pins the codebase's ~100-col style, so this is a
+      # no-op on clean code and only fails on genuine drift.
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Lint: warnings are errors, so clippy nits can't pile up.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Correctness: unit tests + the perft gate + the incremental-hash
+      # debug_assert all run here (the latter two live inside `cargo test`).
+      - name: Test
+        run: cargo test
+
+      # Prove the fat-LTO release profile (the binary that actually matters) still
+      # compiles — debug compiling is not enough for an engine.
+      - name: Release build
+        run: cargo build --release
