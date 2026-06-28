@@ -37,6 +37,12 @@
 //!
 //! **Quiescence (issue #26).** At the leaves [`qsearch`] keeps resolving captures
 //! until the position is quiet before evaluating, removing the horizon effect.
+//!
+//! **Draw detection (issue #28).** Before searching a node the engine scores
+//! threefold repetition and the fifty-move rule as draws, so it stops shuffling
+//! in dead-drawn endgames and recognizes a line is not winning. The repetition
+//! key stack lives on the search context (seeded from the game history), not on
+//! the `Board`, which stays a pure value.
 
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +70,21 @@ pub const MATE: i32 = 31_000;
 
 /// Default transposition-table size in MB when none is set via UCI.
 pub const DEFAULT_TT_MB: usize = 16;
+
+/// A draw — repetition or the fifty-move rule — scores zero (issue #28).
+const DRAW: i32 = 0;
+
+/// Whether the current position (`hash`) has occurred earlier in the line. Only
+/// the last `halfmove` plies can hold a repeat — a pawn move or capture is
+/// irreversible and resets the clock, so no earlier position can recur across one
+/// — so we scan back only that far. A single in-tree repeat is treated as a draw:
+/// it's enough to stop the search wasting effort shuffling. `rep` holds the keys
+/// of every ancestor position (game history + the search path above this node).
+fn is_repetition(hash: u64, halfmove: u16, rep: &[u64]) -> bool {
+    let window = halfmove as usize;
+    let start = rep.len().saturating_sub(window);
+    rep[start..].contains(&hash)
+}
 
 /// Any score at or beyond this magnitude encodes a forced mate (`MATE - plies`).
 /// The margin comfortably exceeds the deepest reachable ply, so it never
@@ -239,6 +260,10 @@ struct SearchContext<'a> {
     /// Butterfly history counters (issue #25), accumulated across this search's
     /// iterative-deepening iterations.
     history: Box<History>,
+    /// Zobrist keys of every position above the current node — the game history
+    /// (from `position … moves`) followed by the keys pushed along the search
+    /// path. Used for repetition detection (issue #28).
+    rep: Vec<u64>,
 }
 
 impl<'a> SearchContext<'a> {
@@ -254,6 +279,7 @@ impl<'a> SearchContext<'a> {
             tt,
             killers: [[Move::NONE; 2]; MAX_PLY],
             history: Box::new([[[0; 64]; 2]; 64]),
+            rep: Vec::new(),
         }
     }
 
@@ -314,10 +340,15 @@ pub fn search_timed(
     stop: Arc<AtomicBool>,
     start: Instant,
     tt: &mut TranspositionTable,
+    game_history: &[u64],
     on_depth: &mut dyn FnMut(&SearchResult, Duration),
 ) -> SearchResult {
     let mut board = board.clone();
     tt.new_search();
+    // Seed repetition history with the keys of the positions the game already
+    // passed through (so a draw the game is about to repeat is seen pre-search).
+    let mut rep = Vec::with_capacity(game_history.len() + 64);
+    rep.extend_from_slice(game_history);
     let mut ctx = SearchContext {
         evaluator: Material,
         deadline: budget.deadline,
@@ -327,6 +358,7 @@ pub fn search_timed(
         tt,
         killers: [[Move::NONE; 2]; MAX_PLY],
         history: Box::new([[[0; 64]; 2]; 64]),
+        rep,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -383,9 +415,11 @@ fn run_root(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32) -> Searc
     let mut best_move = Move::NONE;
     let mut alpha = -INF;
     for mv in moves {
+        ctx.rep.push(board.hash); // this (root) position becomes an ancestor below
         let undo = board.make_move(mv);
         let score = -negamax(board, ctx, depth - 1, -INF, -alpha, 1);
         board.unmake_move(mv, undo);
+        ctx.rep.pop();
 
         if ctx.aborted {
             break; // the score is from an interrupted subtree — don't trust it.
@@ -415,6 +449,15 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
         return 0; // value ignored: the caller discards aborted iterations.
     }
 
+    // Repetition is a draw, and is path-dependent (not a property of the position
+    // alone), so it must be checked before the TT — a TT entry stored for this
+    // key on a non-repeating path would otherwise mask it. A repeated position
+    // can never be checkmate (the earlier identical one wasn't terminal), so it's
+    // safe to return before generating moves.
+    if is_repetition(board.hash, board.halfmove_clock, &ctx.rep) {
+        return DRAW;
+    }
+
     let alpha_orig = alpha;
 
     // Transposition probe. An entry searched at least as deep as we need lets us
@@ -424,10 +467,14 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
     // indistinguishable from searching the node. Its best move drives ordering
     // (below) even when too shallow to cut. A deeper entry probed at a shallower
     // node returns the deeper score — a known, accepted fixed-depth instability.
+    //
+    // Suppress the *cut* at the fifty-move boundary: the clock isn't part of the
+    // key, so a cached score from a lower clock could hide a draw we owe to the
+    // rule below. (The stored move is still fine for ordering.)
     let mut tt_move = Move::NONE;
     if let Some(entry) = ctx.tt.probe(board.hash) {
         tt_move = entry.best_move;
-        if entry.depth as u32 >= depth {
+        if board.halfmove_clock < 100 && entry.depth as u32 >= depth {
             let score = score_from_tt(entry.score, ply);
             match entry.bound {
                 Bound::Exact => return score,
@@ -446,6 +493,12 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
         return terminal_score(board, ply);
     }
 
+    // Fifty-move rule — but only now that we know there's a legal move:
+    // checkmate delivered on the 50th move is a mate, not a draw.
+    if board.halfmove_clock >= 100 {
+        return DRAW;
+    }
+
     if depth == 0 {
         // Resolve pending captures before evaluating, so the leaf is quiet.
         return qsearch(board, ctx, alpha, beta, ply);
@@ -457,9 +510,11 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
 
     let mut best_move = Move::NONE;
     for mv in moves {
+        ctx.rep.push(board.hash); // this position becomes an ancestor of the child
         let undo = board.make_move(mv);
         let score = -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1);
         board.unmake_move(mv, undo);
+        ctx.rep.pop();
 
         if ctx.aborted {
             return alpha; // unwind promptly; the result will be discarded.
@@ -643,6 +698,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             now,
             &mut tt,
+            &[],
             &mut |r: &SearchResult, _| depths.push(r.depth),
         );
         assert_eq!(depths, vec![1, 2, 3], "should report depths 1..=3 as they complete");
@@ -661,8 +717,15 @@ mod tests {
             max_depth: 64,
         };
         let mut tt = TranspositionTable::new(1);
-        let result =
-            search_timed(&b, &budget, Arc::new(AtomicBool::new(false)), now, &mut tt, &mut |_, _| {});
+        let result = search_timed(
+            &b,
+            &budget,
+            Arc::new(AtomicBool::new(false)),
+            now,
+            &mut tt,
+            &[],
+            &mut |_, _| {},
+        );
         assert!(now.elapsed() < Duration::from_millis(2000), "overran budget: {:?}", now.elapsed());
         assert!(legal_strings(&b).contains(&result.best_move.to_string()));
     }
@@ -677,7 +740,7 @@ mod tests {
         let budget = Budget { deadline: None, max_depth: 64 };
         let stop = Arc::new(AtomicBool::new(true)); // already stopped
         let mut tt = TranspositionTable::new(1);
-        let result = search_timed(&b, &budget, stop, now, &mut tt, &mut |_, _| {});
+        let result = search_timed(&b, &budget, stop, now, &mut tt, &[], &mut |_, _| {});
         assert_ne!(result.best_move, Move::NONE, "must not forfeit when moves exist");
         assert!(legal_strings(&b).contains(&result.best_move.to_string()));
     }
@@ -734,6 +797,70 @@ mod tests {
         let b = board("4k3/3p4/2p5/1P6/3P4/8/8/4K3 w - - 0 1");
         let s = search(&b, 1).score;
         assert!(s.abs() < 80, "a defended-pawn grab should not look winning, got {s}");
+    }
+
+    // ── Draw detection (issue #28) ──────────────────────────────────────────
+
+    #[test]
+    fn repetition_is_detected_only_within_the_halfmove_window() {
+        // `rep` holds ancestor keys oldest-first. A key repeating an ancestor
+        // inside the last `halfmove` plies is a draw; an older match is not (an
+        // irreversible move reset the clock, so it can't actually recur).
+        let rep = [10u64, 20, 30, 40];
+        assert!(is_repetition(20, 4, &rep)); // 20 is within the window of 4
+        assert!(!is_repetition(20, 2, &rep)); // window 2 scans only [30,40]
+        assert!(!is_repetition(99, 4, &rep)); // never occurred
+        assert!(!is_repetition(10, 0, &rep)); // window 0 scans nothing
+    }
+
+    #[test]
+    fn fifty_move_rule_scores_a_won_position_as_a_draw() {
+        // White is up a whole queen, but the halfmove clock is at the limit and
+        // no capture or pawn move can reset it, so every continuation is a draw.
+        // (Depth 1, so the search can't instead find a forced mate.)
+        let b = board("8/8/8/8/4k3/8/8/Q6K w - - 100 1");
+        let s = search(&b, 1).score;
+        assert_eq!(s, 0, "fifty-move rule should score this drawn, got {s}");
+    }
+
+    #[test]
+    fn checkmate_takes_precedence_over_the_fifty_move_rule() {
+        // The clock is at 99, so Ra8# is the 100th ply — but checkmate ends the
+        // game, so it's scored as a mate, not a fifty-move draw.
+        let b = board("6k1/5ppp/8/8/8/8/8/R5K1 w - - 99 1");
+        let r = search(&b, 1);
+        assert_eq!(r.best_move.to_string(), "a1a8");
+        assert_eq!(r.score, MATE - 1);
+    }
+
+    #[test]
+    fn a_seeded_repetition_lets_a_losing_side_claim_a_draw() {
+        // White is down a whole queen — every line loses (~-900). But if a move
+        // reaches a position already in the game history, that's a draw worth 0,
+        // strictly better than losing. We seed the key of one move's result, so
+        // the *only* way the root score is 0 (not deeply negative) is the
+        // repetition being recognized — a discriminating test, unlike a winning
+        // side that scores positive whether or not repetition works.
+        let root = board("6k1/8/8/8/8/1q6/8/6K1 w - - 10 1");
+        let saving = generate_legal(&root)[0];
+        let mut after = root.clone();
+        after.make_move(saving);
+        let repeated_key = after.hash;
+
+        // History long enough that the window (halfmove 10+) reaches the seed.
+        let history = vec![repeated_key; 4];
+        let mut tt = TranspositionTable::new(1);
+        let budget = Budget { deadline: None, max_depth: 3 };
+        let r = search_timed(
+            &root,
+            &budget,
+            Arc::new(AtomicBool::new(false)),
+            Instant::now(),
+            &mut tt,
+            &history,
+            &mut |_, _| {},
+        );
+        assert_eq!(r.score, 0, "should claim the seeded repetition draw, got {}", r.score);
     }
 
     #[test]

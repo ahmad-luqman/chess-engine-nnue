@@ -69,6 +69,9 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: &mut W) -> io::Result<()
     // scores across iterative-deepening iterations and across moves in a game,
     // and is cleared on `ucinewgame` / resized by `setoption name Hash`.
     let mut tt = TranspositionTable::new(DEFAULT_TT_MB);
+    // Zobrist keys of the positions played so far this game (before the current
+    // one), so the search can score threefold repetition (issue #28).
+    let mut game_history: Vec<u64> = Vec::new();
 
     for line in input.lines() {
         let line = line?;
@@ -94,9 +97,10 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: &mut W) -> io::Result<()
             "ucinewgame" => {
                 board = startpos();
                 tt.clear();
+                game_history.clear();
             }
             "setoption" => set_option(&mut tt, tokens),
-            "position" => set_position(&mut board, tokens),
+            "position" => set_position(&mut board, &mut game_history, tokens),
             "go" => {
                 // Turn the `go` arguments into a time budget, then run iterative
                 // deepening until that budget is spent (issue #21). `now` is the
@@ -115,7 +119,7 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: &mut W) -> io::Result<()
                     let mut on_depth = |r: &SearchResult, elapsed: Duration| {
                         let _ = write_info(out, r, elapsed);
                     };
-                    search_timed(&board, &budget, stop, now, &mut tt, &mut on_depth)
+                    search_timed(&board, &budget, stop, now, &mut tt, &game_history, &mut on_depth)
                 };
 
                 if result.best_move == Move::NONE {
@@ -156,7 +160,13 @@ fn startpos() -> Board {
 /// We rebuild the base position, then play each listed move in order. A
 /// malformed command leaves the board at the base position rather than
 /// panicking — the next `position`/`ucinewgame` will reset it anyway.
-fn set_position<'a, I: Iterator<Item = &'a str>>(board: &mut Board, mut tokens: I) {
+fn set_position<'a, I: Iterator<Item = &'a str>>(
+    board: &mut Board,
+    history: &mut Vec<u64>,
+    mut tokens: I,
+) {
+    // Rebuild the repetition history from scratch alongside the board.
+    history.clear();
     let base = match tokens.next() {
         Some("startpos") => startpos(),
         Some("fen") => {
@@ -173,7 +183,7 @@ fn set_position<'a, I: Iterator<Item = &'a str>>(board: &mut Board, mut tokens: 
             match Board::from_str(&fen_fields.join(" ")) {
                 Ok(b) => {
                     *board = b;
-                    apply_moves(board, tokens);
+                    apply_moves(board, history, tokens);
                     return;
                 }
                 Err(_) => return, // unparseable FEN: ignore the command.
@@ -186,7 +196,7 @@ fn set_position<'a, I: Iterator<Item = &'a str>>(board: &mut Board, mut tokens: 
     // For `startpos`, the remaining tokens are `[moves ...]`; skip the keyword.
     if let Some(kw) = tokens.next() {
         if kw == "moves" {
-            apply_moves(board, tokens);
+            apply_moves(board, history, tokens);
         }
     }
 }
@@ -196,10 +206,14 @@ fn set_position<'a, I: Iterator<Item = &'a str>>(board: &mut Board, mut tokens: 
 /// state). Each token is matched against the legal move list so the packed
 /// move's flags — capture, castle, en-passant, promotion — come straight from
 /// the generator instead of being re-derived here.
-fn apply_moves<'a, I: Iterator<Item = &'a str>>(board: &mut Board, moves: I) {
+///
+/// Records each position's Zobrist key *before* its move into `history`, so the
+/// search can detect repetitions that span the moves already played in the game.
+fn apply_moves<'a, I: Iterator<Item = &'a str>>(board: &mut Board, history: &mut Vec<u64>, moves: I) {
     for tok in moves {
         match parse_uci_move(board, tok) {
             Some(mv) => {
+                history.push(board.hash);
                 board.make_move(mv);
             }
             None => break,
