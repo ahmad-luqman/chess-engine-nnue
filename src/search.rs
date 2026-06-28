@@ -264,6 +264,13 @@ struct SearchContext<'a> {
     /// (from `position … moves`) followed by the keys pushed along the search
     /// path. Used for repetition detection (issue #28).
     rep: Vec<u64>,
+    /// PVS diagnostics (issue #34): how many null-window scout searches we ran,
+    /// and how many of those failed high and forced a full-window re-search. A
+    /// low `researches / scouts` ratio is the signal that move ordering is doing
+    /// its job — the scout proves most moves worse without a re-search. Counts
+    /// only; they never affect the result.
+    pvs_scouts: u64,
+    pvs_researches: u64,
 }
 
 impl<'a> SearchContext<'a> {
@@ -280,6 +287,8 @@ impl<'a> SearchContext<'a> {
             killers: [[Move::NONE; 2]; MAX_PLY],
             history: Box::new([[[0; 64]; 2]; 64]),
             rep: Vec::new(),
+            pvs_scouts: 0,
+            pvs_researches: 0,
         }
     }
 
@@ -359,6 +368,8 @@ pub fn search_timed(
         killers: [[Move::NONE; 2]; MAX_PLY],
         history: Box::new([[[0; 64]; 2]; 64]),
         rep,
+        pvs_scouts: 0,
+        pvs_researches: 0,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -417,7 +428,23 @@ fn run_root(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32) -> Searc
     for mv in moves {
         ctx.rep.push(board.hash); // this (root) position becomes an ancestor below
         let undo = board.make_move(mv);
-        let score = -negamax(board, ctx, depth - 1, -INF, -alpha, 1);
+        let score = if best_move == Move::NONE {
+            // First (best-ordered) move: a full-window search establishes the PV
+            // baseline. (-INF, -alpha) is the original root window.
+            -negamax(board, ctx, depth - 1, -INF, -alpha, 1)
+        } else {
+            // PVS scout: prove later moves worse than the PV with a null window.
+            // The root takes no beta cutoff (its beta is +INF), so any fail-high
+            // is a genuine new best — re-search it full-width for an exact score.
+            ctx.pvs_scouts += 1;
+            let s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, 1);
+            if !ctx.aborted && s > alpha {
+                ctx.pvs_researches += 1;
+                -negamax(board, ctx, depth - 1, -INF, -alpha, 1)
+            } else {
+                s
+            }
+        };
         board.unmake_move(mv, undo);
         ctx.rep.pop();
 
@@ -516,10 +543,28 @@ fn negamax(
     order_moves(&mut moves, board, tt_move, &ctx.killers[ply_idx], &ctx.history, side);
 
     let mut best_move = Move::NONE;
-    for mv in moves {
+    for (i, mv) in moves.into_iter().enumerate() {
         ctx.rep.push(board.hash); // this position becomes an ancestor of the child
         let undo = board.make_move(mv);
-        let score = -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1);
+        let score = if i == 0 {
+            // The first (best-ordered) move is the PV candidate: search it with
+            // the full window so its exact score sets alpha for the scouts below.
+            -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1)
+        } else {
+            // PVS scout (issue #34): a null window (alpha, alpha+1) only asks "is
+            // this move worse than the PV?". A fail-low costs far less than a full
+            // search. On a fail-high — and only when our own window is wider than
+            // null (`s < beta`), else the scout already *is* the full window — the
+            // move may be a new PV, so re-search it full-width for its true score.
+            ctx.pvs_scouts += 1;
+            let s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1);
+            if !ctx.aborted && s > alpha && s < beta {
+                ctx.pvs_researches += 1;
+                -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1)
+            } else {
+                s
+            }
+        };
         board.unmake_move(mv, undo);
         ctx.rep.pop();
 
@@ -889,6 +934,60 @@ mod tests {
             "warm TT should visit fewer nodes: cold {} then warm {}",
             cold.nodes,
             warm.nodes
+        );
+    }
+
+    /// PVS must be **result-invariant**: with the transposition table disabled it
+    /// returns exactly the score (and, where the position has a unique answer, the
+    /// move) that plain alpha-beta did. These golden numbers were captured from the
+    /// pre-PVS engine with a disabled TT at depth 6. The TT is disabled on purpose:
+    /// PVS stores null-window bounds a full-window search never would, so *with* a
+    /// TT a fixed-depth score can legitimately differ (the accepted instability
+    /// documented at the TT probe) — that would make this a flaky, wrong assertion.
+    #[test]
+    fn pvs_is_result_invariant_with_tt_disabled() {
+        // (fen, golden score, unique best move or None when many moves tie)
+        let cases: [(&str, i32, Option<&str>); 5] = [
+            // Startpos scores 0 with many equal replies — assert score only.
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 0, None),
+            ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 35, Some("e2a6")),
+            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 90, Some("b4f4")),
+            ("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 25, Some("c3d5")),
+            ("4k3/8/8/8/3q4/8/8/3RK3 w - - 0 1", 500, Some("d1d4")),
+        ];
+        for (fen, score, best) in cases {
+            let b = board(fen);
+            let mut tt = TranspositionTable::disabled();
+            let r = search_with_tt(&b, 6, &mut tt);
+            assert_eq!(r.score, score, "score changed for {fen}");
+            if let Some(mv) = best {
+                assert_eq!(r.best_move.to_string(), mv, "best move changed for {fen}");
+            }
+        }
+    }
+
+    /// Sanity check on the PVS scout: with TT + ordering doing their job, almost
+    /// every scout proves a move worse without a full-width re-search. A high
+    /// re-search rate would mean ordering is broken (or PVS is miswired) and the
+    /// scout is pure overhead. We run a normal middlegame through iterative
+    /// deepening (so the TT seeds ordering, as in a real search) and assert the
+    /// re-search rate stays well under 20%.
+    #[test]
+    fn pvs_research_rate_stays_low() {
+        let b = board("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10");
+        let mut tt = TranspositionTable::new(16);
+        tt.new_search();
+        let mut ctx = SearchContext::unbounded(&mut tt);
+        let mut bb = b.clone();
+        for d in 1..=7 {
+            run_root(&mut bb, &mut ctx, d);
+        }
+        assert!(ctx.pvs_scouts > 1000, "expected many scouts, got {}", ctx.pvs_scouts);
+        assert!(
+            ctx.pvs_researches * 5 < ctx.pvs_scouts,
+            "re-search rate too high: {} researches / {} scouts",
+            ctx.pvs_researches,
+            ctx.pvs_scouts
         );
     }
 }

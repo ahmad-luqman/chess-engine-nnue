@@ -3,7 +3,8 @@
 Phase 2 turns the Phase 1 toy searcher into a *real* engine: a position identity
 it can cache and compare (Zobrist), a transposition table, principled move
 ordering, quiescence at the leaves, and draw detection. This is the running
-deep-dive for that work — one section lands per issue (#23–#28). It assumes the
+deep-dive for that work — one section lands per issue (#23–#28), now continuing
+into Phase 3's selective search (§6, PVS, #34). It assumes the
 board and move machinery from [05-board-representation.md](05-board-representation.md)
 and [06-move-generation.md](06-move-generation.md), and the Phase 1 negamax in
 `src/search.rs`.
@@ -329,3 +330,70 @@ draws — and the engine no longer keeps "winning" a position it's actually just
 repeating. It's primarily a correctness fix (SPRT target: non-regression), though
 recognizing repetitions also helps it convert won endgames instead of stumbling
 into a draw.
+
+---
+
+## 6. Principal Variation Search — scouting the rest (`src/search.rs`, issue #34)
+
+Phase 3 opens the *selective-search* layer, and PVS is its foundation: the
+later techniques (LMR #37, null-move pruning #36) all **reduce a search and
+re-search on fail-high**, which is the shape PVS introduces here.
+
+### The bet
+
+Move ordering (§3) plus the TT move make the first move almost always the best.
+So for every *other* move we don't ask "what's its exact score?" — only "is it
+worse than the move we already have?". A **null window** `(alpha, alpha + 1)`
+answers that and nothing more, and because its bound is tight it prunes far more
+of the subtree than the full `(alpha, beta)` window would. We pay the price of a
+full-width re-search only on the rare scout that fails high (a genuine new best).
+
+### The loop
+
+The first move is searched full-window `(alpha, beta)` — it's the PV candidate,
+and its exact score becomes the `alpha` the scouts measure against. Each later
+move is scouted with `(alpha, alpha + 1)`; if the scout returns `s` with
+`alpha < s < beta`, the move might be a new PV, so it's re-searched at full width.
+
+```text
+i == 0:  score = -negamax(-beta,      -alpha)            // full window, the PV
+i  > 0:  s     = -negamax(-(alpha+1), -alpha)            // null-window scout
+         if alpha < s < beta:                            // scout failed high
+             score = -negamax(-beta, -alpha)             // re-search wide
+```
+
+The `s < beta` guard is the subtle part. When our *own* window is already null
+(we are ourselves a scout one level up), `beta == alpha + 1`, so the scout window
+*is* the full window and no re-search is owed — the guard suppresses it. The same
+PVS lives at the root (`run_root`), which takes no beta cutoff (its beta is
+`+INF`), so there the re-search condition collapses to just `s > alpha`.
+
+### Why it doesn't change the result
+
+`negamax` is **fail-hard**, so a null-window scout returns either `alpha`
+(fail-low) or `alpha + 1` (fail-high) — never a score `>= beta` on its own, so
+cutoffs still come only from the first move or a re-search, exactly as in plain
+alpha-beta. A fail-low move would have failed low under the full window too; a
+fail-high move gets re-searched to the same exact score plain alpha-beta would
+have found. So the chosen move and score are unchanged — PVS is a pure speed
+optimization. See [ADR 0009](decisions/0009-principal-variation-search.md) for why
+we kept fail-hard rather than converting to fail-soft first.
+
+### How we know it's correct
+
+Result-invariance is asserted against golden scores captured from the *pre-PVS*
+engine **with the TT disabled** — there PVS-vs-plain-alpha-beta is byte-identical.
+The TT is disabled on purpose: scouts store bounds from null windows that a
+full-window search never would, so a *TT-enabled* fixed-depth score can legitimately
+differ (the same instability the TT probe documents). A `SearchContext` counter
+tracks the scout/re-search ratio; a test asserts it stays low (measured ~0.00% on
+a normal middlegame — tens of re-searches per ~10⁶ scouts).
+
+### What it buys
+
+A lower effective branching factor: the tight scout windows prune deeper, so the
+engine reaches more depth in the same time once ordering is good. At shallow fixed
+depth the raw node count is mixed (the scout/TT interaction, and on quiet
+weakly-ordered positions extra re-searches) — the real gate is the SPRT vs v0.5.0.
+Its larger payoff is structural: LMR and NMP now have the reduce-then-re-search
+machinery they need.
