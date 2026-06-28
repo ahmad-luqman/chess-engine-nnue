@@ -315,7 +315,9 @@ fn parse_go<'a, I: Iterator<Item = &'a str>>(mut tokens: I) -> Limits {
 /// variation (just the best move for now).
 fn write_info<W: Write>(output: &mut W, r: &SearchResult, elapsed: Duration) -> io::Result<()> {
     let ms = elapsed.as_millis() as u64;
-    let nps = if ms > 0 { r.nodes * 1000 / ms } else { r.nodes };
+    // nodes/sec; fall back to the raw node count when elapsed rounds to 0 ms
+    // (checked_div sidesteps the divide-by-zero rather than guarding it by hand).
+    let nps = (r.nodes * 1000).checked_div(ms).unwrap_or(r.nodes);
     writeln!(
         output,
         "info depth {} score {} nodes {} nps {} time {} pv {}",
