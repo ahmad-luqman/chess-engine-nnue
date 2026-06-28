@@ -148,18 +148,48 @@ anchor modes:
 - **`sf` (default)** — one throttled Stockfish per rung; `MIN_ELO`/`MAX_ELO`/`STEP`
   control the rating range. Cheap (one binary), but Stockfish's `UCI_Elo` is itself
   approximate (treat as ±100) and floored at 1320. Needs `stockfish` on `PATH`.
-- **`file`** — a roster of real engines with published ratings (e.g.
-  [CCRL Blitz](https://computerchess.org.uk/ccrl/404/)), one per line in
-  [`scripts/anchors.txt`](../scripts/anchors.txt) as `name | rating | cmd | opts`.
-  More defensible, since the number is quoted on the anchors' own scale.
+- **`file`** — a roster of real engines with published ratings, one per line as
+  `name | rating | cmd | opts`, where `opts` is passed verbatim to fastchess (so it
+  carries `option.X=Y` UCI options *and* per-engine limits like `nodes=1`). Two
+  ready rosters are committed, kept separate so a single mean never mixes pools:
+  - [`scripts/anchors-maia.txt`](../scripts/anchors-maia.txt) — **human (Lichess)
+    Elo**: lc0 + [Maia](https://github.com/CSSLab/maia-chess) nets (1100–1900) run
+    at `nodes=1`, each playing like a human of that rating. Needs `lc0` and the
+    nets under `~/chess-engines/maia/`.
+  - [`scripts/anchors-ccrl.txt`](../scripts/anchors-ccrl.txt) — **engine (CCRL)
+    Elo**: standalone UCI engines with [CCRL Blitz](https://computerchess.org.uk/ccrl/404/)
+    ratings. The defensible "where am I on the engine lists" number. On Apple
+    Silicon the catch is that CCRL-rated weak/mid engines are x86-era (inline asm),
+    so they're cross-compiled for x86_64 and run via **Rosetta 2** (the committed
+    roster uses Cinnamon 2.2a=2071 and 2.3=2212).
+  - [`scripts/anchors.txt`](../scripts/anchors.txt) is a template/example.
+
+  One command provisions both pools (downloads Maia nets, cross-builds the Cinnamon
+  anchors, builds Ordo) and regenerates the rosters with absolute paths for the
+  current machine: [`scripts/setup-anchors.sh`](../scripts/setup-anchors.sh)
+  (needs `brew install stockfish lc0` and Rosetta). Run the two pools separately —
+  never merge human and engine Elo in one mean:
+
+  ```
+  scripts/setup-anchors.sh
+  MODE=file ANCHORS=scripts/anchors-ccrl.txt scripts/gauntlet.sh   # engine (CCRL) Elo
+  MODE=file ANCHORS=scripts/anchors-maia.txt scripts/gauntlet.sh   # human (Lichess) Elo
+  ```
 
 Pick anchors that **bracket** the engine (some below, some above): a rung the
 candidate sweeps 100%/0% gives only a bound and is excluded from the mean (and
-flagged, so you re-range). If `ordo` is installed it runs a rigorous multi-anchor
-cross-check on the combined PGN. Caveats: Elo is **pool-relative** — CCRL, CEGT,
-SSDF and human FIDE are different pools and not directly comparable; time control
-and hardware are part of any rating, so quote them. Use this as an occasional
-sanity check, not a per-change gate — SPRT stays the development loop.
+flagged, so you re-range). If [`ordo`](https://github.com/michiguel/Ordo) is on
+`PATH` it runs a rigorous multi-anchor cross-check on the combined PGN. (Ordo has
+no Homebrew formula; on macOS build it with the spinlock→mutex fallback, since
+Darwin lacks POSIX spinlocks: `git clone https://github.com/michiguel/Ordo && cd
+Ordo && make CC=clang CFLAGS="-DNDEBUG -DMY_SEMAPHORES -DNSPINLOCKS -flto -I myopt
+-I sysport" && cp ordo /opt/homebrew/bin/`.)
+
+Caveats: Elo is **pool-relative** — CCRL, CEGT, SSDF and human FIDE are different
+pools and not directly comparable; time control and hardware are part of any
+rating, so quote them. Maia in particular is the **Lichess human** pool, not CCRL.
+Use this as an occasional sanity check, not a per-change gate — SPRT stays the
+development loop.
 
 ## The working method (every change, Phase 1+)
 

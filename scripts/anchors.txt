@@ -4,7 +4,8 @@
 #   name    label shown in the table (no spaces)
 #   rating  the anchor's KNOWN rating on the scale you want to quote (e.g. CCRL Blitz)
 #   cmd     command to launch the engine (on PATH or an absolute path)
-#   opts    optional space-separated UCI options as key=val (passed as option.key=val)
+#   opts    VERBATIM fastchess -engine tokens: UCI options as option.key=val AND/OR
+#           per-engine limits like nodes=1 or st=2 (e.g. lc0+Maia needs nodes=1)
 #
 # Lines starting with '#' and blank lines are ignored. Pick a handful of engines
 # whose published ratings BRACKET your engine (some below it, some above) so the
@@ -13,9 +14,9 @@
 # (https://computerchess.org.uk/ccrl/404/ for CCRL Blitz).
 #
 # Example using Stockfish at fixed UCI_Elo rungs as stand-in anchors:
-sf1500 | 1500 | stockfish | UCI_LimitStrength=true UCI_Elo=1500
-sf1800 | 1800 | stockfish | UCI_LimitStrength=true UCI_Elo=1800
-sf2100 | 2100 | stockfish | UCI_LimitStrength=true UCI_Elo=2100
+sf1500 | 1500 | stockfish | option.UCI_LimitStrength=true option.UCI_Elo=1500
+sf1800 | 1800 | stockfish | option.UCI_LimitStrength=true option.UCI_Elo=1800
+sf2100 | 2100 | stockfish | option.UCI_LimitStrength=true option.UCI_Elo=2100
 #
 # Example using real standalone engines with CCRL ratings (edit paths/ratings):
 # tscp181   | 1726 | /usr/local/bin/tscp

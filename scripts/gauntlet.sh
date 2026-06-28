@@ -17,9 +17,10 @@
 #
 #   file          — a roster of real engines with published ratings (e.g. CCRL).
 #                   ANCHORS=<file>, one per line: name | rating | cmd | opts...
-#                   ('opts' are space-separated key=val, passed as option.key=val;
-#                    '#' comments and blank lines ignored). More defensible if the
-#                   anchors are rated on the scale you want to quote.
+#                   ('opts' is passed verbatim as fastchess -engine tokens, so it
+#                    carries UCI options like option.UCI_Elo=1800 AND per-engine
+#                    limits like nodes=1 / st=N; '#' and blank lines ignored).
+#                    More defensible if anchors are rated on the scale you quote.
 #
 # Usage:
 #   scripts/gauntlet.sh [tc]
@@ -62,6 +63,9 @@ FASTCHESS="${FASTCHESS:-/opt/homebrew/bin/fastchess}"
 
 command -v "$FASTCHESS" >/dev/null 2>&1 || { echo "error: fastchess not found at $FASTCHESS" >&2; exit 1; }
 
+# Trim leading/trailing whitespace (pure bash — safe with apostrophes, quotes, '=').
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
 # ── Candidate build ───────────────────────────────────────────────────────────
 if [[ "$CANDIDATE" == "target/release/engine" ]]; then
     echo ">> building candidate (cargo build --release)…" >&2
@@ -86,13 +90,15 @@ if [[ "$MODE" == "sf" ]]; then
     done
 elif [[ "$MODE" == "file" ]]; then
     [[ -f "$ANCHORS" ]] || { echo "error: roster file '$ANCHORS' not found (MODE=file)" >&2; exit 1; }
+    # The 4th field is passed VERBATIM as fastchess -engine tokens, so it can carry
+    # both UCI options (option.UCI_Elo=1800) and per-engine limits (nodes=1, st=N).
     while IFS='|' read -r name rating cmd opts; do
-        name="$(echo "$name" | xargs)"; rating="$(echo "$rating" | xargs)"
-        cmd="$(echo "$cmd" | xargs)";   opts="$(echo "${opts:-}" | xargs)"
-        [[ -z "$name" || "$name" == \#* ]] && continue
-        local_opts=""
-        for kv in $opts; do local_opts+="option.$kv "; done
-        NAMES+=("$name"); RATINGS+=("$rating"); CMDS+=("$cmd"); OPTS+=("$local_opts")
+        # Skip blanks/comments BEFORE any processing (comment text may hold quotes).
+        probe="$(trim "$name")"
+        [[ -z "$probe" || "$probe" == \#* ]] && continue
+        name="$(trim "$name")"; rating="$(trim "$rating")"
+        cmd="$(trim "$cmd")";   opts="$(trim "${opts:-}")"
+        NAMES+=("$name"); RATINGS+=("$rating"); CMDS+=("$cmd"); OPTS+=("$opts")
     done < "$ANCHORS"
 else
     echo "error: MODE must be 'sf' or 'file' (got '$MODE')" >&2; exit 1
