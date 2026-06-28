@@ -12,6 +12,7 @@ pub mod moves;
 pub mod perft;
 pub mod search;
 pub mod timeman;
+pub mod tt;
 pub mod types;
 pub mod uci;
 pub mod zobrist;

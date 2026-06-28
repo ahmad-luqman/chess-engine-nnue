@@ -24,7 +24,12 @@
 //! management possible: when the clock runs out we always have a fully-searched
 //! move in hand, and we simply stop before starting a depth we can't finish.
 //!
-//! Transposition tables, move ordering, and quiescence come in Phase 2.
+//! **Transposition table (issue #24).** Searched positions are cached in a
+//! [`TranspositionTable`] keyed by Zobrist hash: a position reached again by a
+//! different move order can reuse the stored score (an immediate cutoff when it
+//! was searched deep enough) instead of being re-searched. The table is borrowed
+//! by the search so it persists across iterative-deepening iterations and, via
+//! UCI, across moves. Move ordering and quiescence come next in Phase 2.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -35,6 +40,7 @@ use crate::eval::{Evaluator, Material};
 use crate::movegen::{generate_legal, in_check};
 use crate::moves::Move;
 use crate::timeman::Budget;
+use crate::tt::{Bound, TranspositionTable};
 
 /// A score larger than any real evaluation — used as the initial alpha/beta
 /// bounds (an open window). Must exceed every score the tree can produce,
@@ -46,6 +52,40 @@ pub const INF: i32 = 32_000;
 /// deliver mate sooner and to delay being mated. `INF > MATE` guarantees mate
 /// scores sit inside the search window.
 pub const MATE: i32 = 31_000;
+
+/// Default transposition-table size in MB when none is set via UCI.
+pub const DEFAULT_TT_MB: usize = 16;
+
+/// Any score at or beyond this magnitude encodes a forced mate (`MATE - plies`).
+/// The margin comfortably exceeds the deepest reachable ply, so it never
+/// misclassifies a positional score as a mate.
+const MATE_BOUND: i32 = MATE - 1000;
+
+/// Adjust a mate score for *storage* in the TT. A mate score is "mate in N plies
+/// **from this node**", but the same position can be probed at a different
+/// distance from the root, so we store it relative to the node (add `ply` going
+/// in) and undo that on the way out — otherwise a cached mate would claim the
+/// wrong distance. Non-mate scores pass through unchanged.
+fn score_to_tt(score: i32, ply: i32) -> i32 {
+    if score >= MATE_BOUND {
+        score + ply
+    } else if score <= -MATE_BOUND {
+        score - ply
+    } else {
+        score
+    }
+}
+
+/// Inverse of [`score_to_tt`]: re-anchor a stored mate score to the probing node.
+fn score_from_tt(score: i32, ply: i32) -> i32 {
+    if score >= MATE_BOUND {
+        score - ply
+    } else if score <= -MATE_BOUND {
+        score + ply
+    } else {
+        score
+    }
+}
 
 /// The outcome of a search: the move to play and why.
 #[derive(Clone, Copy, Debug)]
@@ -65,7 +105,7 @@ pub struct SearchResult {
 /// Mutable state threaded through a single search: the evaluator, the node
 /// counter, and the two ways a search can be cut short — a wall-clock deadline
 /// and a stop flag.
-struct SearchContext {
+struct SearchContext<'a> {
     evaluator: Material,
     /// When set, the search aborts once `Instant::now()` passes this point.
     /// `None` means "no time limit" (depth-limited or unbounded search).
@@ -78,18 +118,22 @@ struct SearchContext {
     /// Latched once a deadline or stop is observed: every node above unwinds
     /// without doing more work, and the partial iteration is discarded.
     aborted: bool,
+    /// Shared transposition table, borrowed so it persists across iterative-
+    /// deepening iterations and (via UCI) across moves.
+    tt: &'a mut TranspositionTable,
 }
 
-impl SearchContext {
-    /// A context with no limits: used by the fixed-depth [`search`] and as the
-    /// guaranteed-move fallback. Its stop flag is never raised.
-    fn unbounded() -> SearchContext {
+impl<'a> SearchContext<'a> {
+    /// A context with no time/stop limits, borrowing `tt`: used by the
+    /// fixed-depth [`search`] and as the guaranteed-move fallback.
+    fn unbounded(tt: &'a mut TranspositionTable) -> SearchContext<'a> {
         SearchContext {
             evaluator: Material,
             deadline: None,
             stop: Arc::new(AtomicBool::new(false)),
             nodes: 0,
             aborted: false,
+            tt,
         }
     }
 
@@ -121,8 +165,18 @@ impl SearchContext {
 /// clamped to at least 1. This is the fixed-depth entry used by tests and as the
 /// fallback that guarantees [`search_timed`] always returns a legal move.
 pub fn search(board: &Board, depth: u32) -> SearchResult {
+    let mut tt = TranspositionTable::new(DEFAULT_TT_MB);
+    search_with_tt(board, depth, &mut tt)
+}
+
+/// Fixed-depth search reusing a caller-owned transposition table. Lets tests
+/// search a position twice (reusing the populated TT) to show the TT changes
+/// speed, not the chosen move, and to run a TT-free reference via
+/// [`TranspositionTable::disabled`].
+pub fn search_with_tt(board: &Board, depth: u32, tt: &mut TranspositionTable) -> SearchResult {
     let mut board = board.clone();
-    let mut ctx = SearchContext::unbounded();
+    tt.new_search();
+    let mut ctx = SearchContext::unbounded(tt);
     run_root(&mut board, &mut ctx, depth.max(1))
 }
 
@@ -139,15 +193,18 @@ pub fn search_timed(
     budget: &Budget,
     stop: Arc<AtomicBool>,
     start: Instant,
+    tt: &mut TranspositionTable,
     on_depth: &mut dyn FnMut(&SearchResult, Duration),
 ) -> SearchResult {
     let mut board = board.clone();
+    tt.new_search();
     let mut ctx = SearchContext {
         evaluator: Material,
         deadline: budget.deadline,
         stop,
         nodes: 0,
         aborted: false,
+        tt,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -174,7 +231,12 @@ pub fn search_timed(
         // Either the position is terminal, or the clock was too tight to finish
         // even depth 1. An unabortable depth-1 search resolves both: it returns a
         // legal move when one exists and Move::NONE only at checkmate/stalemate.
-        best = search(&board, 1);
+        // Reuse the context (and its TT) but clear the abort latch and limits so
+        // this last-resort iteration always completes.
+        ctx.aborted = false;
+        ctx.deadline = None;
+        ctx.stop = Arc::new(AtomicBool::new(false));
+        best = run_root(&mut board, &mut ctx, 1);
     }
     best
 }
@@ -183,7 +245,7 @@ pub fn search_timed(
 /// remembers which move achieved alpha and takes no beta cutoff (there is no
 /// parent to cut to — we want the genuinely best move). Bails out cleanly if the
 /// context aborts mid-iteration.
-fn run_root(board: &mut Board, ctx: &mut SearchContext, depth: u32) -> SearchResult {
+fn run_root(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32) -> SearchResult {
     let moves = generate_legal(board);
     if moves.is_empty() {
         let score = terminal_score(board, 0);
@@ -206,16 +268,44 @@ fn run_root(board: &mut Board, ctx: &mut SearchContext, depth: u32) -> SearchRes
         }
     }
 
+    // Cache the root result (a full-window search, so exact) for the next
+    // iteration and future moves. Never store a partial result from an aborted
+    // iteration — its score is untrustworthy.
+    if !ctx.aborted && best_move != Move::NONE {
+        ctx.tt.store(board.hash, best_move, score_to_tt(alpha, 0), depth as u8, Bound::Exact);
+    }
+
     SearchResult { best_move, score: alpha, depth, nodes: ctx.nodes }
 }
 
 /// Negamax with fail-hard alpha-beta. Returns the position's score from the
 /// side-to-move's perspective, searched to `depth` plies. `ply` is the distance
 /// from the root, used to make mate scores prefer faster mates.
-fn negamax(board: &mut Board, ctx: &mut SearchContext, depth: u32, mut alpha: i32, beta: i32, ply: i32) -> i32 {
+fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha: i32, beta: i32, ply: i32) -> i32 {
     ctx.nodes += 1;
     if ctx.should_stop() {
         return 0; // value ignored: the caller discards aborted iterations.
+    }
+
+    let alpha_orig = alpha;
+
+    // Transposition probe. An entry searched at least as deep as we need lets us
+    // cut immediately, how depending on its bound: an exact score returns
+    // directly; a lower bound can only fail us high (≥ beta), an upper bound low
+    // (≤ alpha). We mirror the fail-hard returns below so a probe cut is
+    // indistinguishable from searching the node. (The stored move drives
+    // ordering in #25.) A deeper entry probed at a shallower node returns the
+    // deeper score — a known, accepted source of fixed-depth score instability.
+    if let Some(entry) = ctx.tt.probe(board.hash) {
+        if entry.depth as u32 >= depth {
+            let score = score_from_tt(entry.score, ply);
+            match entry.bound {
+                Bound::Exact => return score,
+                Bound::Lower if score >= beta => return beta,
+                Bound::Upper if score <= alpha => return alpha,
+                _ => {}
+            }
+        }
     }
 
     // Generate first so we can distinguish terminal nodes (no legal moves) from
@@ -230,6 +320,7 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext, depth: u32, mut alpha: i3
         return ctx.evaluator.evaluate(board);
     }
 
+    let mut best_move = Move::NONE;
     for mv in moves {
         let undo = board.make_move(mv);
         let score = -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1);
@@ -240,13 +331,21 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext, depth: u32, mut alpha: i3
         }
         if score >= beta {
             // The opponent has a refutation good enough that they'd avoid this
-            // whole line; no need to look further (fail-hard cutoff).
+            // whole line; no need to look further (fail-hard cutoff). Cache it as
+            // a lower bound with the refuting move.
+            ctx.tt.store(board.hash, mv, score_to_tt(beta, ply), depth as u8, Bound::Lower);
             return beta;
         }
         if score > alpha {
             alpha = score;
+            best_move = mv;
         }
     }
+
+    // No cutoff: an Exact score if some move beat alpha (a PV node), otherwise an
+    // Upper bound (every move failed low). Cache it with the best move found.
+    let bound = if alpha > alpha_orig { Bound::Exact } else { Bound::Upper };
+    ctx.tt.store(board.hash, best_move, score_to_tt(alpha, ply), depth as u8, bound);
 
     alpha
 }
@@ -342,11 +441,13 @@ mod tests {
         let now = Instant::now();
         let budget = Budget { deadline: None, max_depth: 3 };
         let mut depths = Vec::new();
+        let mut tt = TranspositionTable::new(1);
         let result = search_timed(
             &b,
             &budget,
             Arc::new(AtomicBool::new(false)),
             now,
+            &mut tt,
             &mut |r: &SearchResult, _| depths.push(r.depth),
         );
         assert_eq!(depths, vec![1, 2, 3], "should report depths 1..=3 as they complete");
@@ -364,7 +465,9 @@ mod tests {
             deadline: Some(now + Duration::from_millis(100)),
             max_depth: 64,
         };
-        let result = search_timed(&b, &budget, Arc::new(AtomicBool::new(false)), now, &mut |_, _| {});
+        let mut tt = TranspositionTable::new(1);
+        let result =
+            search_timed(&b, &budget, Arc::new(AtomicBool::new(false)), now, &mut tt, &mut |_, _| {});
         assert!(now.elapsed() < Duration::from_millis(2000), "overran budget: {:?}", now.elapsed());
         assert!(legal_strings(&b).contains(&result.best_move.to_string()));
     }
@@ -378,8 +481,55 @@ mod tests {
         let now = Instant::now();
         let budget = Budget { deadline: None, max_depth: 64 };
         let stop = Arc::new(AtomicBool::new(true)); // already stopped
-        let result = search_timed(&b, &budget, stop, now, &mut |_, _| {});
+        let mut tt = TranspositionTable::new(1);
+        let result = search_timed(&b, &budget, stop, now, &mut tt, &mut |_, _| {});
         assert_ne!(result.best_move, Move::NONE, "must not forfeit when moves exist");
         assert!(legal_strings(&b).contains(&result.best_move.to_string()));
+    }
+
+    // ── Transposition table (issue #24) ─────────────────────────────────────
+
+    #[test]
+    fn tt_does_not_change_the_chosen_move() {
+        // The correctness anchor: enabling the TT must not change which move the
+        // search plays — only how fast it gets there. (We compare the move, not
+        // the score: a depth-preferred TT can shift a fixed-depth score via the
+        // depth-leak, which is expected, not a bug.)
+        let positions = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 1",
+            "r2q1rk1/ppp2ppp/2np1n2/2b1p1B1/2B1P1b1/2NP1N2/PPP2PPP/R2Q1RK1 w - - 0 1",
+        ];
+        for fen in positions {
+            let b = board(fen);
+            for depth in 1..=3 {
+                let mut off = TranspositionTable::disabled();
+                let mut on = TranspositionTable::new(4);
+                let without = search_with_tt(&b, depth, &mut off);
+                let with = search_with_tt(&b, depth, &mut on);
+                assert_eq!(
+                    with.best_move, without.best_move,
+                    "{fen} d{depth}: TT changed the chosen move"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reusing_a_populated_tt_cuts_nodes_and_keeps_the_move() {
+        // Searching the same position twice with the same table: the second pass
+        // reuses cached results, so it visits far fewer nodes and plays the same
+        // move — the TT changes speed, not the decision.
+        let b = board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 1");
+        let mut tt = TranspositionTable::new(16);
+        let cold = search_with_tt(&b, 4, &mut tt);
+        let warm = search_with_tt(&b, 4, &mut tt);
+        assert_eq!(cold.best_move, warm.best_move);
+        assert!(
+            warm.nodes < cold.nodes,
+            "warm TT should visit fewer nodes: cold {} then warm {}",
+            cold.nodes,
+            warm.nodes
+        );
     }
 }

@@ -35,8 +35,9 @@ use std::time::{Duration, Instant};
 use crate::board::Board;
 use crate::movegen::generate_legal;
 use crate::moves::Move;
-use crate::search::{search_timed, SearchResult, MATE};
+use crate::search::{search_timed, SearchResult, DEFAULT_TT_MB, MATE};
 use crate::timeman::{self, Limits};
+use crate::tt::TranspositionTable;
 use crate::types::{PieceType, Square};
 
 /// The standard starting position, in FEN. Shared shape with `main.rs`'s
@@ -64,6 +65,10 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: &mut W) -> io::Result<()
     // The single piece of cross-command state. Starts at the standard position
     // so a bare `go` before any `position` still has something legal to play.
     let mut board = startpos();
+    // The transposition table outlives individual searches: it carries learned
+    // scores across iterative-deepening iterations and across moves in a game,
+    // and is cleared on `ucinewgame` / resized by `setoption name Hash`.
+    let mut tt = TranspositionTable::new(DEFAULT_TT_MB);
 
     for line in input.lines() {
         let line = line?;
@@ -76,11 +81,21 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: &mut W) -> io::Result<()
             "uci" => {
                 writeln!(output, "id name {ENGINE_NAME}")?;
                 writeln!(output, "id author {ENGINE_AUTHOR}")?;
-                // No `option` lines yet; we expose no configurable parameters.
+                // Advertise the one parameter we honour: the TT size in MB.
+                writeln!(
+                    output,
+                    "option name Hash type spin default {DEFAULT_TT_MB} min 1 max 4096"
+                )?;
                 writeln!(output, "uciok")?;
             }
             "isready" => writeln!(output, "readyok")?,
-            "ucinewgame" => board = startpos(),
+            // Starting a new game: reset the board and discard learned scores so
+            // entries from the previous game can't leak in.
+            "ucinewgame" => {
+                board = startpos();
+                tt.clear();
+            }
+            "setoption" => set_option(&mut tt, tokens),
             "position" => set_position(&mut board, tokens),
             "go" => {
                 // Turn the `go` arguments into a time budget, then run iterative
@@ -100,7 +115,7 @@ pub fn run_loop<R: BufRead, W: Write>(input: R, output: &mut W) -> io::Result<()
                     let mut on_depth = |r: &SearchResult, elapsed: Duration| {
                         let _ = write_info(out, r, elapsed);
                     };
-                    search_timed(&board, &budget, stop, now, &mut on_depth)
+                    search_timed(&board, &budget, stop, now, &mut tt, &mut on_depth)
                 };
 
                 if result.best_move == Move::NONE {
@@ -235,6 +250,27 @@ fn promo_letter(pt: PieceType) -> Option<u8> {
     }
 }
 
+/// Apply a `setoption name <id> value <v>` command. We honour exactly one
+/// option, `Hash` (the TT size in MB); anything else is ignored, as the spec
+/// requires. The grammar is positional: a `name` keyword, the option id, then a
+/// `value` keyword and its value. A malformed or out-of-range value is ignored
+/// rather than treated as an error.
+fn set_option<'a, I: Iterator<Item = &'a str>>(tt: &mut TranspositionTable, mut tokens: I) {
+    if tokens.next() != Some("name") {
+        return;
+    }
+    let Some(name) = tokens.next() else { return };
+    if !name.eq_ignore_ascii_case("Hash") {
+        return; // unknown option
+    }
+    if tokens.next() != Some("value") {
+        return;
+    }
+    if let Some(mb) = tokens.next().and_then(|t| t.parse::<usize>().ok()) {
+        tt.resize(mb.clamp(1, 4096));
+    }
+}
+
 /// Parse a `go` command's arguments into [`Limits`]. Each keyword that takes a
 /// value consumes the following token; flags like `infinite` stand alone.
 /// Unknown keywords are skipped, so partial/extended `go` lines don't break us.
@@ -314,6 +350,27 @@ mod tests {
     #[test]
     fn isready_acks() {
         assert!(run("isready\nquit\n").contains("readyok"));
+    }
+
+    #[test]
+    fn uci_advertises_the_hash_option() {
+        let out = run("uci\nquit\n");
+        assert!(out.contains("option name Hash"), "missing Hash option line: {out:?}");
+    }
+
+    #[test]
+    fn setoption_hash_resizes_without_breaking_search() {
+        // Resize the table, then a normal search must still produce a legal move
+        // (exercises the resize path and confirms the new table is usable).
+        let out = run("setoption name Hash value 1\nposition startpos\ngo depth 3\nquit\n");
+        assert!(bestmove(&out).is_some(), "no bestmove after setoption Hash: {out:?}");
+    }
+
+    #[test]
+    fn ucinewgame_clears_then_search_still_works() {
+        let out = run("position startpos\ngo depth 2\nucinewgame\nposition startpos\ngo depth 2\nquit\n");
+        // Two bestmove lines, one per `go`.
+        assert_eq!(out.matches("bestmove ").count(), 2, "expected two searches: {out:?}");
     }
 
     #[test]
