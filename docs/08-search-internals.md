@@ -221,4 +221,62 @@ SPRT against v0.1.0 decisive.
 
 ---
 
-*Sections for quiescence (#26) and draw detection (#28) land with those issues.*
+## 4. Quiescence search — quiet leaves (`src/search.rs`, issue #26)
+
+A fixed-depth search stops at depth 0 no matter what's happening on the board. If
+that leaf falls in the *middle of a capture sequence* — say White has just taken
+a pawn but Black's recapture is one ply past the horizon — the static eval scores
+the half-finished trade as if it were over. This is the **horizon effect**, and
+v0.1.0 shows it textbook-clearly: the start-position score swings ~100cp between
+even and odd depths, and even dips negative, purely from where the leaf lands in
+a pawn trade.
+
+### The fix: don't evaluate a noisy position
+
+At depth 0 we call `qsearch` instead of evaluating directly. `qsearch` keeps
+playing out **captures and promotions** until the position is quiet, then
+evaluates. Its backbone is the **stand-pat** score:
+
+```
+stand_pat = evaluate(board)
+if stand_pat >= beta { return beta }   // already good enough; don't bother capturing
+if stand_pat > alpha { alpha = stand_pat }
+for each capture/promotion (MVV-LVA order):
+    score = -qsearch(-beta, -alpha)
+    ... usual alpha-beta ...
+```
+
+The insight is that the side to move is **not forced to capture** — it can "stand
+pat" on the current position — so the static eval is a *lower bound* on the node's
+value. We only explore captures that might beat it. That both makes the search
+sound (we never force a side into a bad capture) and keeps it cheap (most nodes
+fail high on stand-pat immediately).
+
+### Why it terminates
+
+Unlike the main search, `qsearch` has no depth counter — yet it always halts,
+because captures strictly remove material from a finite board, so any chain of
+captures is bounded. A `ply` cap guards against pathological promotion lines
+regardless.
+
+### Scope and simplifications
+
+We generate captures and promotions by filtering the legal moves (a dedicated
+capture generator is a later speedup) and order them by MVV-LVA — the same victim
+/attacker scoring as #25, no TT move or killers here. Two deliberate
+simplifications for this first cut: we don't generate checks, and we stand-pat
+even when in check (so a leaf that is actually checkmate may be scored by eval).
+Both are standard early-stage compromises; check evasions in quiescence can come
+later if they prove worth it.
+
+### What it buys
+
+The start-position score stabilises across depths (the even/odd swing collapses)
+and tactical leaves resolve their exchanges, so the engine stops both
+overvaluing won-but-about-to-be-recaptured material and undervaluing sound
+sacrifices. Quiescence is historically one of the single biggest strength jumps
+in a fixed-depth engine.
+
+---
+
+*The draw-detection (#28) section lands with that issue.*
