@@ -93,5 +93,82 @@ arrives when #24 (TT) and #28 (repetition/fifty-move) build on `Board::hash`.
 
 ---
 
-*Sections for the transposition table (#24), move ordering (#25), quiescence
-(#26), and draw detection (#28) land with those issues.*
+## 2. Transposition table — caching searched positions (`src/tt.rs`, issue #24)
+
+Now that a position has a cheap identity (its Zobrist key), we can cache the
+result of searching it. The same position recurs constantly — via different move
+orders within one search, and across iterative-deepening iterations — and the TT
+turns each recurrence from "search it again" into "look it up".
+
+### The entry and the table
+
+The table is a flat `Vec<Entry>` sized to a power of two; the index is the low
+bits of the key (`hash & (len-1)`). Each entry records:
+
+- `key` — the **full** 64-bit hash, so a slot shared by many positions
+  (collision) is detected and ignored rather than trusted,
+- `best_move` — the strongest move-ordering signal (consumed in #25),
+- `score` + `bound` — the value and *what kind* of value it is,
+- `depth` — how deep that value was searched,
+- `age` — which search generation wrote it, for replacement.
+
+### Bounds: a score is rarely the whole story
+
+Alpha-beta doesn't always compute an exact score. When a node fails high (a move
+beats `beta`) we stop early, so all we know is the score is *at least* that — a
+**lower bound**. When every move fails low (none beats `alpha`) we know the score
+is *at most* `alpha` — an **upper bound**. Only a node that finishes with a move
+strictly inside the window yields an **exact** score. The TT stores which case it
+was, because that determines how a probe may use it:
+
+```
+Exact → return the stored score directly
+Lower → usable only if it proves a fail-high (score ≥ beta) → cut
+Upper → usable only if it proves a fail-low  (score ≤ alpha) → cut
+```
+
+and only when the stored search was **at least as deep** as what we need now
+(`entry.depth >= depth`). We keep the search **fail-hard** (a probe cut returns
+`beta`/`alpha`, exactly what searching the node would have), so switching the TT
+off is byte-for-byte identical to the Phase 1 search.
+
+### Mate scores need re-anchoring
+
+A mate score means "mate in N plies *from this node*". The same position can sit
+at different distances from the root in different lines, so we store mate scores
+relative to the node — add `ply` on the way in, subtract it on the way out
+(`score_to_tt`/`score_from_tt`). Without this a cached mate would claim the wrong
+distance and the engine would misorder or misreport forced mates.
+
+### Replacement and lifetime
+
+One slot per index, so a store sometimes evicts. We keep the more useful entry:
+an empty slot or one from an older search is always overwritten; otherwise the
+**deeper** entry wins. The table is owned by the UCI layer and *borrowed* by the
+search, so it survives across iterative-deepening iterations and across moves in
+a game. `ucinewgame` clears it; `setoption name Hash value <MB>` resizes it
+(default 16 MB).
+
+### The honest caveat: fixed-depth scores aren't bit-invariant
+
+Depth-preferred probing means a position stored at depth 5 and re-probed at a
+depth-2 node returns the depth-5 score — a "depth-leak". It only makes a leaf
+*more* accurate, and every engine does it, but it means a fixed-depth search
+with the TT on can report a slightly different *score* than with it off. So the
+correctness tests assert the **best move** is unchanged (plus the existing
+exact-score tactical/mate tests still pass), not bit-identical scores. See
+ADR 0006.
+
+### What it buys
+
+Within one search, transposition cutoffs prune re-searched subtrees; across
+iterations, the previous depth's results are cached. The *big* win, though, is
+searching the stored best move first — that's move ordering (#25), where this
+work pays off. On its own, and especially while the engine still throws away won
+endgames for lack of quiescence (#26) and draw detection (#28), the TT's
+measurable Elo is smaller and noisier — expected from splitting #24 and #25.
+
+---
+
+*Sections for move ordering (#25), quiescence (#26), and draw detection (#28)
+land with those issues.*
