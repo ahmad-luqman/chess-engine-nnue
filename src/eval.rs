@@ -36,7 +36,7 @@ pub trait Evaluator {
 /// counted — both sides always have exactly one, so it cancels, and giving it a
 /// finite value would just be noise. These are the classic values; PSTs (issue
 /// #20) layer positional adjustments on top.
-const PIECE_VALUE: [i32; 6] = [
+pub const PIECE_VALUE: [i32; 6] = [
     100, // Pawn
     320, // Knight
     330, // Bishop

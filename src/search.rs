@@ -31,16 +31,18 @@
 //! by the search so it persists across iterative-deepening iterations and, via
 //! UCI, across moves. Move ordering and quiescence come next in Phase 2.
 
+use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::board::Board;
-use crate::eval::{Evaluator, Material};
+use crate::eval::{Evaluator, Material, PIECE_VALUE};
 use crate::movegen::{generate_legal, in_check};
 use crate::moves::Move;
 use crate::timeman::Budget;
 use crate::tt::{Bound, TranspositionTable};
+use crate::types::Color;
 
 /// A score larger than any real evaluation — used as the initial alpha/beta
 /// bounds (an open window). Must exceed every score the tree can produce,
@@ -87,6 +89,110 @@ fn score_from_tt(score: i32, ply: i32) -> i32 {
     }
 }
 
+// ── Move ordering (issue #25) ───────────────────────────────────────────────
+//
+// Alpha-beta's pruning power comes almost entirely from searching the best move
+// first: a good first guess collapses the effective branching factor. We score
+// each move and search highest first. The bands, in priority order:
+//
+//   TT move  >  captures/promotions (MVV-LVA)  >  killers  >  history (quiets)
+//
+// The bands are spaced far enough apart that no in-band score can cross into a
+// neighbour (history is bounded well below the killer band — see the cap below).
+
+/// Maximum search ply we track killer moves for; deeper plies simply skip them.
+const MAX_PLY: usize = 128;
+
+/// The transposition-table best move — the single strongest ordering signal.
+const TT_BONUS: i32 = 1 << 28;
+/// Base for captures and promotions, lifted above all quiet moves.
+const CAPTURE_BONUS: i32 = 1 << 24;
+/// The two killer slots, just below captures and above history.
+const KILLER_BONUS: [i32; 2] = [1 << 23, (1 << 23) - 1];
+/// History scores are clamped below the killer band so bands never overlap.
+const HISTORY_MAX: i32 = (1 << 23) - 2;
+
+/// Butterfly history: `[from][side][to]` cutoff counters for quiet moves. Boxed
+/// because it is 32 KiB — too big to sit inline in a stack-allocated context.
+type History = [[[i32; 64]; 2]; 64];
+
+/// Killer moves: two quiet moves per ply that recently caused a beta cutoff.
+type Killers = [[Move; 2]; MAX_PLY];
+
+/// Order score for `mv` (higher searched first). Reads the position for MVV-LVA
+/// victim/attacker values and the search's killer/history tables for quiets.
+fn move_score(
+    board: &Board,
+    mv: Move,
+    tt_move: Move,
+    killers: &[Move; 2],
+    history: &History,
+    side: Color,
+) -> i32 {
+    if mv == tt_move {
+        return TT_BONUS;
+    }
+
+    let promo = mv.promotion_piece().map_or(0, |pt| PIECE_VALUE[pt.index()]);
+    if mv.is_capture() || promo != 0 {
+        // MVV-LVA: most valuable victim first, least valuable attacker breaking
+        // ties (so PxQ outranks QxQ). An en-passant victim is always a pawn.
+        let victim = if mv.is_en_passant() {
+            PIECE_VALUE[0]
+        } else if mv.is_capture() {
+            board.piece_on(mv.to()).map_or(0, |p| PIECE_VALUE[p.piece_type.index()])
+        } else {
+            0
+        };
+        let attacker = board.piece_on(mv.from()).map_or(0, |p| PIECE_VALUE[p.piece_type.index()]);
+        return CAPTURE_BONUS + victim * 16 - attacker + promo;
+    }
+
+    // Quiet move: killers first, then the history score.
+    if mv == killers[0] {
+        KILLER_BONUS[0]
+    } else if mv == killers[1] {
+        KILLER_BONUS[1]
+    } else {
+        history[mv.from().0 as usize][side.index()][mv.to().0 as usize]
+    }
+}
+
+/// Record a quiet beta-cutoff move as a killer for `ply`, keeping the two most
+/// recent distinct ones (most recent in slot 0).
+fn store_killer(killers: &mut [Move; 2], mv: Move) {
+    if killers[0] != mv {
+        killers[1] = killers[0];
+        killers[0] = mv;
+    }
+}
+
+/// Reward a quiet move that caused a beta cutoff, by depth² (deeper cutoffs are
+/// more valuable), clamped so the score stays within its ordering band.
+fn update_history(history: &mut History, side: Color, mv: Move, depth: u32) {
+    let slot = &mut history[mv.from().0 as usize][side.index()][mv.to().0 as usize];
+    *slot = (*slot + (depth * depth) as i32).min(HISTORY_MAX);
+}
+
+/// Sort `moves` highest-score first (see [`move_score`]). `sort_by_cached_key`
+/// evaluates each move's score once, so the position lookups aren't repeated.
+fn order_moves(
+    moves: &mut [Move],
+    board: &Board,
+    tt_move: Move,
+    killers: &[Move; 2],
+    history: &History,
+    side: Color,
+) {
+    moves.sort_by_cached_key(|&mv| Reverse(move_score(board, mv, tt_move, killers, history, side)));
+}
+
+/// Whether `mv` is a capture or promotion — a "tactical" move, excluded from the
+/// killer/history heuristics, which track *quiet* cutoffs only.
+fn is_tactical(mv: Move) -> bool {
+    mv.is_capture() || mv.promotion_piece().is_some()
+}
+
 /// The outcome of a search: the move to play and why.
 #[derive(Clone, Copy, Debug)]
 pub struct SearchResult {
@@ -121,6 +227,11 @@ struct SearchContext<'a> {
     /// Shared transposition table, borrowed so it persists across iterative-
     /// deepening iterations and (via UCI) across moves.
     tt: &'a mut TranspositionTable,
+    /// Killer moves per ply (issue #25), fresh each search.
+    killers: Killers,
+    /// Butterfly history counters (issue #25), accumulated across this search's
+    /// iterative-deepening iterations.
+    history: Box<History>,
 }
 
 impl<'a> SearchContext<'a> {
@@ -134,6 +245,8 @@ impl<'a> SearchContext<'a> {
             nodes: 0,
             aborted: false,
             tt,
+            killers: [[Move::NONE; 2]; MAX_PLY],
+            history: Box::new([[[0; 64]; 2]; 64]),
         }
     }
 
@@ -205,6 +318,8 @@ pub fn search_timed(
         nodes: 0,
         aborted: false,
         tt,
+        killers: [[Move::NONE; 2]; MAX_PLY],
+        history: Box::new([[[0; 64]; 2]; 64]),
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -246,11 +361,17 @@ pub fn search_timed(
 /// parent to cut to — we want the genuinely best move). Bails out cleanly if the
 /// context aborts mid-iteration.
 fn run_root(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32) -> SearchResult {
-    let moves = generate_legal(board);
+    let mut moves = generate_legal(board);
     if moves.is_empty() {
         let score = terminal_score(board, 0);
         return SearchResult { best_move: Move::NONE, score, depth, nodes: ctx.nodes };
     }
+
+    // Search the previous iteration's best move (the TT move) first — the single
+    // biggest iterative-deepening speedup — then captures, killers, history.
+    let side = board.side_to_move;
+    let tt_move = ctx.tt.probe(board.hash).map_or(Move::NONE, |e| e.best_move);
+    order_moves(&mut moves, board, tt_move, &ctx.killers[0], &ctx.history, side);
 
     let mut best_move = Move::NONE;
     let mut alpha = -INF;
@@ -293,10 +414,12 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
     // cut immediately, how depending on its bound: an exact score returns
     // directly; a lower bound can only fail us high (≥ beta), an upper bound low
     // (≤ alpha). We mirror the fail-hard returns below so a probe cut is
-    // indistinguishable from searching the node. (The stored move drives
-    // ordering in #25.) A deeper entry probed at a shallower node returns the
-    // deeper score — a known, accepted source of fixed-depth score instability.
+    // indistinguishable from searching the node. Its best move drives ordering
+    // (below) even when too shallow to cut. A deeper entry probed at a shallower
+    // node returns the deeper score — a known, accepted fixed-depth instability.
+    let mut tt_move = Move::NONE;
     if let Some(entry) = ctx.tt.probe(board.hash) {
+        tt_move = entry.best_move;
         if entry.depth as u32 >= depth {
             let score = score_from_tt(entry.score, ply);
             match entry.bound {
@@ -311,7 +434,7 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
     // Generate first so we can distinguish terminal nodes (no legal moves) from
     // a quiet leaf. This must come before the depth check: a checkmate at depth
     // 0 is a mate, not whatever the static eval happens to say.
-    let moves = generate_legal(board);
+    let mut moves = generate_legal(board);
     if moves.is_empty() {
         return terminal_score(board, ply);
     }
@@ -319,6 +442,10 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
     if depth == 0 {
         return ctx.evaluator.evaluate(board);
     }
+
+    let side = board.side_to_move;
+    let ply_idx = (ply as usize).min(MAX_PLY - 1);
+    order_moves(&mut moves, board, tt_move, &ctx.killers[ply_idx], &ctx.history, side);
 
     let mut best_move = Move::NONE;
     for mv in moves {
@@ -332,7 +459,12 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
         if score >= beta {
             // The opponent has a refutation good enough that they'd avoid this
             // whole line; no need to look further (fail-hard cutoff). Cache it as
-            // a lower bound with the refuting move.
+            // a lower bound, and reward a *quiet* refutation as a killer/history
+            // move so siblings try it earlier.
+            if !is_tactical(mv) {
+                store_killer(&mut ctx.killers[ply_idx], mv);
+                update_history(&mut ctx.history, side, mv, depth);
+            }
             ctx.tt.store(board.hash, mv, score_to_tt(beta, ply), depth as u8, Bound::Lower);
             return beta;
         }
