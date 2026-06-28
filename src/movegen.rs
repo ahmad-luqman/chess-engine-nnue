@@ -135,10 +135,12 @@ pub fn pawn_attacks(color: Color, sq: Square) -> Bitboard {
 // a drop-in that perft must still match exactly (issue #27).
 
 /// Rook ray directions as `(file_step, rank_step)`: along ranks and files.
-pub(crate) const ROOK_DIRS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+/// `pub` (with [`ray_attacks`]) only so `benches/` can measure the magic-bitboard
+/// speedup against this ray-walk oracle; not part of the move-gen API.
+pub const ROOK_DIRS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 
-/// Bishop ray directions: the four diagonals.
-pub(crate) const BISHOP_DIRS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+/// Bishop ray directions: the four diagonals. See [`ROOK_DIRS`] on visibility.
+pub const BISHOP_DIRS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
 
 /// Walk each ray out from `sq` until the board edge or the first occupied
 /// square, unioning every square reached.
@@ -149,7 +151,9 @@ pub(crate) const BISHOP_DIRS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1
 /// the move generator (issue #15) masks off blockers of the *mover's own*
 /// color afterward. Keeping that decision out of here is what lets one function
 /// serve both attack detection and capture generation.
-pub(crate) fn ray_attacks(sq: Square, occupied: Bitboard, dirs: &[(i8, i8)]) -> Bitboard {
+/// `pub` only for `benches/` (the magic-vs-oracle slider comparison); inside the
+/// crate the magic [`rook_attacks`]/[`bishop_attacks`] are what callers use.
+pub fn ray_attacks(sq: Square, occupied: Bitboard, dirs: &[(i8, i8)]) -> Bitboard {
     let mut bb = Bitboard::EMPTY;
     let start_file = sq.file() as i8;
     let start_rank = sq.rank() as i8;

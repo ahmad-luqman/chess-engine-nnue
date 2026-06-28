@@ -12,6 +12,17 @@ path = "src/main.rs"
 name = "engine"
 path = "src/lib.rs"
 
+[dev-dependencies]
+# Statistics-driven micro-benchmarks (issue #30). Local-only, not run in CI;
+# criterion builds optimized, so benches always measure release-grade code.
+criterion = "0.8"
+
+# `harness = false` hands `main` to criterion instead of libtest, so `cargo
+# bench` runs the criterion groups defined in benches/engine.rs.
+[[bench]]
+name = "engine"
+harness = false
+
 # Release profile is what matters for an engine: search speed is everything.
 # We turn on fat LTO and a single codegen unit so the optimizer can see the
 # whole program. `cargo run` (debug) will be ~10-50x slower — always bench in

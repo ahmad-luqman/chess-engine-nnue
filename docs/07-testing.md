@@ -112,6 +112,43 @@ git tag -a v0.1.0 -m "first playable: search + eval + UCI"
 cargo build --release && mkdir -p baseline && cp target/release/engine baseline/
 ```
 
+## Speed: criterion micro-benchmarks
+
+SPRT answers *is it stronger?*; benchmarks answer the orthogonal *is it faster?*
+— catching nodes/sec regressions in the hot paths with numbers instead of
+guesses (issue #30). The benches live in [`benches/engine.rs`](../benches/engine.rs)
+and reuse the published perft FENs, so they time the exact positions the
+correctness tests pin. They're **local-only** (not run in CI); criterion always
+builds optimized, so there's no separate `--release` flag to remember.
+
+```
+cargo bench                                  # run every group, print results
+cargo bench --bench engine sliders           # one group (substring filter)
+```
+
+The groups: `perft` (startpos d5, Kiwipete d4 — the end-to-end movegen +
+make/unmake loop), `generate_legal`, `eval` (`Material::evaluate`),
+`make_unmake` (the round-trip), and `sliders` (magic bitboards vs the
+`ray_attacks` oracle they replaced — quantifies the issue #27 win).
+
+### Catching regressions: save a baseline, compare against it
+
+Criterion's value is the diff between two runs. Tag a known-good point, then
+compare later work against it:
+
+```
+cargo bench -- --save-baseline v0.5.0        # stash current numbers as "v0.5.0"
+# …make a change…
+cargo bench -- --baseline v0.5.0             # re-run, report % change vs baseline
+```
+
+A run with no `--baseline` compares against the *last* run (stored under
+`target/criterion/`), so plain `cargo bench` twice already shows a delta. Use a
+named baseline when you want a stable reference (e.g. a release) to measure
+several iterations against. Criterion flags each change `improved` / `regressed`
+past a noise threshold, so looks-like-a-win noise doesn't fool you — the same
+discipline as iron rule #3, applied to speed.
+
 ## See also
 
 - [03-roadmap.md](03-roadmap.md) — the phased plan and the working method.
