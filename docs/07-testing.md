@@ -134,13 +134,19 @@ fastchess \
 3. `scripts/sprt.sh <prev-tag>` — strength vs the previous tagged build.
 4. Keep the change only if SPRT reports `PASS`; otherwise revert.
 5. When a gainer lands, **tag a release** and rebuild the baseline from it, so
-   there's always an opponent to measure the next change against.
+   there's always an opponent to measure the next change against — one command
+   ([`scripts/release.sh`](../scripts/release.sh), issue #32):
 
 ```
-git tag -a v0.1.0 -m "first playable: search + eval + UCI"
-# build & stash the baseline binary the next SPRT will play against
-cargo build --release && mkdir -p baseline && cp target/release/engine baseline/
+scripts/release.sh 0.6.0 "null-move pruning: +40 Elo vs v0.5.0"
 ```
+
+It refuses on a dirty tree or failing `cargo test`, then bumps `Cargo.toml`,
+commits, tags `v0.6.0`, pushes (commit + tag), rebuilds `--release`, and copies
+the fresh build to `baseline/engine` so the *next* change measures against the
+engine that just won. `--dry-run` runs every gate and prints the plan without
+mutating anything. Git tags stay the source of truth; `baseline/` is gitignored
+and any baseline is rebuildable from its tag (that's what `scripts/sprt.sh` does).
 
 ## Speed: criterion micro-benchmarks
 
