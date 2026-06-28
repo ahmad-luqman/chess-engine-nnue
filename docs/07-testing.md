@@ -127,6 +127,40 @@ fastchess \
   illegal or mistyped move panics by name rather than emitting a bad position.
 - `-concurrency` to taste (≈ physical cores); strength is independent of it.
 
+### Absolute Elo: gauntlet vs rated anchors
+
+SPRT gives *relative* Elo (candidate vs the previous version) — the scale floats,
+with no tie to any external number. To answer "roughly how strong are we on a
+public scale?" you play a **gauntlet** against opponents whose rating is already
+known, then read your rating off relative to theirs.
+[`scripts/gauntlet.sh`](../scripts/gauntlet.sh) does this:
+
+```
+scripts/gauntlet.sh                                    # Stockfish rungs 1320..2400 @ 10+0.1
+MIN_ELO=1400 MAX_ELO=2000 STEP=100 scripts/gauntlet.sh # tighter, lower band
+MODE=file ANCHORS=scripts/anchors.txt scripts/gauntlet.sh 30+0.3
+```
+
+Each anchor yields an estimate (`anchor_rating + measured_diff`); the headline is
+their **inverse-variance-weighted mean** (tighter anchors count for more). Two
+anchor modes:
+
+- **`sf` (default)** — one throttled Stockfish per rung; `MIN_ELO`/`MAX_ELO`/`STEP`
+  control the rating range. Cheap (one binary), but Stockfish's `UCI_Elo` is itself
+  approximate (treat as ±100) and floored at 1320. Needs `stockfish` on `PATH`.
+- **`file`** — a roster of real engines with published ratings (e.g.
+  [CCRL Blitz](https://computerchess.org.uk/ccrl/404/)), one per line in
+  [`scripts/anchors.txt`](../scripts/anchors.txt) as `name | rating | cmd | opts`.
+  More defensible, since the number is quoted on the anchors' own scale.
+
+Pick anchors that **bracket** the engine (some below, some above): a rung the
+candidate sweeps 100%/0% gives only a bound and is excluded from the mean (and
+flagged, so you re-range). If `ordo` is installed it runs a rigorous multi-anchor
+cross-check on the combined PGN. Caveats: Elo is **pool-relative** — CCRL, CEGT,
+SSDF and human FIDE are different pools and not directly comparable; time control
+and hardware are part of any rating, so quote them. Use this as an occasional
+sanity check, not a per-change gate — SPRT stays the development loop.
+
 ## The working method (every change, Phase 1+)
 
 1. Make one change.

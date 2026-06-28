@@ -1,0 +1,23 @@
+# Anchor roster for scripts/gauntlet.sh (MODE=file).
+#
+# One engine per line, pipe-separated:   name | rating | cmd | opts...
+#   name    label shown in the table (no spaces)
+#   rating  the anchor's KNOWN rating on the scale you want to quote (e.g. CCRL Blitz)
+#   cmd     command to launch the engine (on PATH or an absolute path)
+#   opts    optional space-separated UCI options as key=val (passed as option.key=val)
+#
+# Lines starting with '#' and blank lines are ignored. Pick a handful of engines
+# whose published ratings BRACKET your engine (some below it, some above) so the
+# weighted estimate is interpolated, not extrapolated. Replace the placeholders
+# below with engines you have installed and their ratings from the relevant list
+# (https://computerchess.org.uk/ccrl/404/ for CCRL Blitz).
+#
+# Example using Stockfish at fixed UCI_Elo rungs as stand-in anchors:
+sf1500 | 1500 | stockfish | UCI_LimitStrength=true UCI_Elo=1500
+sf1800 | 1800 | stockfish | UCI_LimitStrength=true UCI_Elo=1800
+sf2100 | 2100 | stockfish | UCI_LimitStrength=true UCI_Elo=2100
+#
+# Example using real standalone engines with CCRL ratings (edit paths/ratings):
+# tscp181   | 1726 | /usr/local/bin/tscp
+# fairymax  | 2030 | /usr/local/bin/fairymax
+# cinnamon  | 2230 | /usr/local/bin/cinnamon

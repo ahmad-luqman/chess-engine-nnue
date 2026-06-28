@@ -28,5 +28,9 @@
 # SPRT runner (scripts/sprt.sh) tee'd log + PGN (PGN also matches *.pgn above).
 /sprt.log
 /sprt.pgn
+# Gauntlet runner (scripts/gauntlet.sh) artifacts (PGN also matches *.pgn above).
+/gauntlet.log
+/gauntlet.pgn
+/gauntlet-ratings.txt
 # Stashed baseline engine binary (the tagged-release SPRT opponent).
 /baseline/
