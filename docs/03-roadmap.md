@@ -3,9 +3,13 @@
 Phased plan. Each phase ends in a *playable, testable* milestone. Elo figures
 are rough order-of-magnitude targets, not promises.
 
-> **Current phase: 1 — Search + eval + UCI.** Phase 0 complete: perft matches
-> published counts for start/Kiwipete/positions 3–5 to depth 5–6 (see
-> [06-move-generation.md](06-move-generation.md)).
+> **Current phase: 3 — Selective search + tuned eval.** Phases 0–2 complete.
+> Phase 2 shipped Zobrist hashing, a transposition table, move ordering,
+> quiescence, draw detection, and magic bitboards (issues #23–#28); see
+> [08-search-internals.md](08-search-internals.md). Cumulative SPRT gains over
+> the Phase 1 release (v0.1.0): TT + ordering **+249 Elo** (v0.2.0), quiescence
+> **+208** (v0.3.0), draw detection **+65** (v0.4.0), magic bitboards **+55**
+> (v0.5.0).
 
 | Phase | Goal | Deliverable | Rough Elo |
 |-------|------|-------------|-----------|

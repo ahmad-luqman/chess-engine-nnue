@@ -63,8 +63,10 @@ cargo clippy --all-targets
 
 Phased plan in [`docs/03-roadmap.md`](docs/03-roadmap.md). Work is tracked as
 GitHub issues: epics (one per phase) with native sub-issues, labelled `phase-*`
-and `type:*`. Current phase: **1 — search + eval + UCI** (Phase 0 complete:
-perft passes; see [`docs/06-move-generation.md`](docs/06-move-generation.md)).
+and `type:*`. Current phase: **3 — selective search + tuned eval** (Phases 0–2
+complete: perft passes, and the Phase 2 search core — Zobrist, TT, move ordering,
+quiescence, draw detection, magic bitboards — is in; see
+[`docs/08-search-internals.md`](docs/08-search-internals.md)).
 
 ## Conventions
 
