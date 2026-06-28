@@ -325,14 +325,8 @@ mod tests {
         assert_eq!(MoveFlag::ROOK_PROMO.promotion_piece(), Some(PieceType::Rook));
         assert_eq!(MoveFlag::QUEEN_PROMO.promotion_piece(), Some(PieceType::Queen));
         // Capturing promotions select the same pieces.
-        assert_eq!(
-            MoveFlag::KNIGHT_PROMO_CAPTURE.promotion_piece(),
-            Some(PieceType::Knight)
-        );
-        assert_eq!(
-            MoveFlag::QUEEN_PROMO_CAPTURE.promotion_piece(),
-            Some(PieceType::Queen)
-        );
+        assert_eq!(MoveFlag::KNIGHT_PROMO_CAPTURE.promotion_piece(), Some(PieceType::Knight));
+        assert_eq!(MoveFlag::QUEEN_PROMO_CAPTURE.promotion_piece(), Some(PieceType::Queen));
         // Non-promotions yield nothing.
         assert_eq!(MoveFlag::QUIET.promotion_piece(), None);
         assert_eq!(MoveFlag::CAPTURE.promotion_piece(), None);
@@ -355,10 +349,7 @@ mod tests {
 
     #[test]
     fn convenience_constructors() {
-        assert_eq!(
-            Move::quiet(sq("e2"), sq("e4")),
-            Move::new(sq("e2"), sq("e4"), MoveFlag::QUIET)
-        );
+        assert_eq!(Move::quiet(sq("e2"), sq("e4")), Move::new(sq("e2"), sq("e4"), MoveFlag::QUIET));
         assert_eq!(
             Move::capture(sq("e4"), sq("d5")),
             Move::new(sq("e4"), sq("d5"), MoveFlag::CAPTURE)
@@ -379,23 +370,11 @@ mod tests {
         assert_eq!(Move::quiet(sq("e2"), sq("e4")).to_string(), "e2e4");
         assert_eq!(Move::capture(sq("e4"), sq("d5")).to_string(), "e4d5");
         // Castling is the king's own move, not O-O.
-        assert_eq!(
-            Move::new(sq("e1"), sq("g1"), MoveFlag::KING_CASTLE).to_string(),
-            "e1g1"
-        );
-        assert_eq!(
-            Move::new(sq("e1"), sq("c1"), MoveFlag::QUEEN_CASTLE).to_string(),
-            "e1c1"
-        );
+        assert_eq!(Move::new(sq("e1"), sq("g1"), MoveFlag::KING_CASTLE).to_string(), "e1g1");
+        assert_eq!(Move::new(sq("e1"), sq("c1"), MoveFlag::QUEEN_CASTLE).to_string(), "e1c1");
         // Promotions append a lowercase piece letter.
-        assert_eq!(
-            Move::new(sq("e7"), sq("e8"), MoveFlag::QUEEN_PROMO).to_string(),
-            "e7e8q"
-        );
-        assert_eq!(
-            Move::new(sq("e7"), sq("e8"), MoveFlag::KNIGHT_PROMO).to_string(),
-            "e7e8n"
-        );
+        assert_eq!(Move::new(sq("e7"), sq("e8"), MoveFlag::QUEEN_PROMO).to_string(), "e7e8q");
+        assert_eq!(Move::new(sq("e7"), sq("e8"), MoveFlag::KNIGHT_PROMO).to_string(), "e7e8n");
         // A promotion-capture still shows only the promotion suffix.
         assert_eq!(
             Move::new(sq("e7"), sq("d8"), MoveFlag::ROOK_PROMO_CAPTURE).to_string(),

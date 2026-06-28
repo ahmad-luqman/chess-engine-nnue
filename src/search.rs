@@ -443,7 +443,14 @@ fn run_root(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32) -> Searc
 /// Negamax with fail-hard alpha-beta. Returns the position's score from the
 /// side-to-move's perspective, searched to `depth` plies. `ply` is the distance
 /// from the root, used to make mate scores prefer faster mates.
-fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha: i32, beta: i32, ply: i32) -> i32 {
+fn negamax(
+    board: &mut Board,
+    ctx: &mut SearchContext<'_>,
+    depth: u32,
+    mut alpha: i32,
+    beta: i32,
+    ply: i32,
+) -> i32 {
     ctx.nodes += 1;
     if ctx.should_stop() {
         return 0; // value ignored: the caller discards aborted iterations.
@@ -555,7 +562,13 @@ fn negamax(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32, mut alpha
 /// capture, so its static eval is a floor. If even that floor beats `beta` we cut;
 /// otherwise we try captures, hoping to raise alpha. Because captures strictly
 /// reduce material, the recursion is finite; a `ply` cap guards pathological lines.
-fn qsearch(board: &mut Board, ctx: &mut SearchContext<'_>, mut alpha: i32, beta: i32, ply: i32) -> i32 {
+fn qsearch(
+    board: &mut Board,
+    ctx: &mut SearchContext<'_>,
+    mut alpha: i32,
+    beta: i32,
+    ply: i32,
+) -> i32 {
     ctx.nodes += 1;
     if ctx.should_stop() {
         return 0; // value ignored: the caller discards aborted iterations.
@@ -578,7 +591,8 @@ fn qsearch(board: &mut Board, ctx: &mut SearchContext<'_>, mut alpha: i32, beta:
     // Only captures and promotions — the moves that change material and so could
     // overturn the stand-pat score. Ordered by MVV-LVA (no TT move or killers in
     // quiescence; history is irrelevant to captures).
-    let mut moves: Vec<Move> = generate_legal(board).into_iter().filter(|&m| is_tactical(m)).collect();
+    let mut moves: Vec<Move> =
+        generate_legal(board).into_iter().filter(|&m| is_tactical(m)).collect();
     order_moves(&mut moves, board, Move::NONE, &[Move::NONE; 2], &ctx.history, board.side_to_move);
 
     for mv in moves {
@@ -712,10 +726,7 @@ mod tests {
         // running away. The tolerance is generous so it won't flake under load.
         let b = board("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 1");
         let now = Instant::now();
-        let budget = Budget {
-            deadline: Some(now + Duration::from_millis(100)),
-            max_depth: 64,
-        };
+        let budget = Budget { deadline: Some(now + Duration::from_millis(100)), max_depth: 64 };
         let mut tt = TranspositionTable::new(1);
         let result = search_timed(
             &b,

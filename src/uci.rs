@@ -209,7 +209,11 @@ fn set_position<'a, I: Iterator<Item = &'a str>>(
 ///
 /// Records each position's Zobrist key *before* its move into `history`, so the
 /// search can detect repetitions that span the moves already played in the game.
-fn apply_moves<'a, I: Iterator<Item = &'a str>>(board: &mut Board, history: &mut Vec<u64>, moves: I) {
+fn apply_moves<'a, I: Iterator<Item = &'a str>>(
+    board: &mut Board,
+    history: &mut Vec<u64>,
+    moves: I,
+) {
     for tok in moves {
         match parse_uci_move(board, tok) {
             Some(mv) => {
@@ -382,7 +386,8 @@ mod tests {
 
     #[test]
     fn ucinewgame_clears_then_search_still_works() {
-        let out = run("position startpos\ngo depth 2\nucinewgame\nposition startpos\ngo depth 2\nquit\n");
+        let out =
+            run("position startpos\ngo depth 2\nucinewgame\nposition startpos\ngo depth 2\nquit\n");
         // Two bestmove lines, one per `go`.
         assert_eq!(out.matches("bestmove ").count(), 2, "expected two searches: {out:?}");
     }
@@ -391,7 +396,8 @@ mod tests {
     fn go_from_startpos_plays_a_legal_move() {
         let out = run("position startpos\ngo depth 2\nquit\n");
         let mv = bestmove(&out).expect("a bestmove line");
-        let legal: Vec<String> = generate_legal(&startpos()).iter().map(|m| m.to_string()).collect();
+        let legal: Vec<String> =
+            generate_legal(&startpos()).iter().map(|m| m.to_string()).collect();
         assert!(legal.contains(&mv), "{mv} is not legal from startpos; legal = {legal:?}");
     }
 
@@ -459,8 +465,6 @@ mod tests {
 
     /// Extract the move from the single `bestmove <m>` line, if present.
     fn bestmove(out: &str) -> Option<String> {
-        out.lines()
-            .find_map(|l| l.strip_prefix("bestmove "))
-            .map(|m| m.trim().to_string())
+        out.lines().find_map(|l| l.strip_prefix("bestmove ")).map(|m| m.trim().to_string())
     }
 }

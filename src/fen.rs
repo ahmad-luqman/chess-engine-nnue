@@ -51,11 +51,7 @@ pub enum ParseFenError {
 /// Map a FEN piece letter to a colored piece. Uppercase = White, lowercase =
 /// Black; `pnbrqk` are the six kinds. Returns `None` for any other byte.
 fn piece_from_fen(byte: u8) -> Option<Piece> {
-    let color = if byte.is_ascii_uppercase() {
-        Color::White
-    } else {
-        Color::Black
-    };
+    let color = if byte.is_ascii_uppercase() { Color::White } else { Color::Black };
     let piece_type = match byte.to_ascii_lowercase() {
         b'p' => PieceType::Pawn,
         b'n' => PieceType::Knight,
@@ -246,8 +242,7 @@ mod tests {
 
     const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     // Kiwipete — the canonical perft position that exercises castling, ep, pins.
-    const KIWIPETE: &str =
-        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+    const KIWIPETE: &str = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
 
     #[test]
     fn startpos_round_trips() {
@@ -309,39 +304,21 @@ mod tests {
         // Five fields instead of six.
         assert_eq!(Board::from_str("8/8/8/8/8/8/8/8 w - -"), Err(WrongFieldCount));
         // Seven ranks in the placement field.
-        assert_eq!(
-            Board::from_str("8/8/8/8/8/8/8 w - - 0 1"),
-            Err(BadPiecePlacement)
-        );
+        assert_eq!(Board::from_str("8/8/8/8/8/8/8 w - - 0 1"), Err(BadPiecePlacement));
         // A rank that sums to 9 files (8 + 1).
-        assert_eq!(
-            Board::from_str("8/8/8/8/8/8/8/8P w - - 0 1"),
-            Err(BadPiecePlacement)
-        );
+        assert_eq!(Board::from_str("8/8/8/8/8/8/8/8P w - - 0 1"), Err(BadPiecePlacement));
         // 'x' is not a piece letter.
         assert_eq!(
             Board::from_str("xnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
             Err(BadPiecePlacement)
         );
         // Side to move neither w nor b.
-        assert_eq!(
-            Board::from_str("8/8/8/8/8/8/8/8 x - - 0 1"),
-            Err(BadSideToMove)
-        );
+        assert_eq!(Board::from_str("8/8/8/8/8/8/8/8 x - - 0 1"), Err(BadSideToMove));
         // Stray castling character.
-        assert_eq!(
-            Board::from_str("8/8/8/8/8/8/8/8 w Z - 0 1"),
-            Err(BadCastling)
-        );
+        assert_eq!(Board::from_str("8/8/8/8/8/8/8/8 w Z - 0 1"), Err(BadCastling));
         // En-passant field that is not a square.
-        assert_eq!(
-            Board::from_str("8/8/8/8/8/8/8/8 w - z9 0 1"),
-            Err(BadEnPassant)
-        );
+        assert_eq!(Board::from_str("8/8/8/8/8/8/8/8 w - z9 0 1"), Err(BadEnPassant));
         // Non-numeric halfmove clock.
-        assert_eq!(
-            Board::from_str("8/8/8/8/8/8/8/8 w - - x 1"),
-            Err(BadHalfmove)
-        );
+        assert_eq!(Board::from_str("8/8/8/8/8/8/8/8 w - - x 1"), Err(BadHalfmove));
     }
 }

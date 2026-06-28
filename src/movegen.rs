@@ -72,30 +72,12 @@ const fn jump_table(offsets: &[(i8, i8)]) -> [Bitboard; 64] {
 
 const fn knight_table() -> [Bitboard; 64] {
     // The eight L-shaped jumps: two in one axis, one in the other.
-    jump_table(&[
-        (1, 2),
-        (2, 1),
-        (2, -1),
-        (1, -2),
-        (-1, -2),
-        (-2, -1),
-        (-2, 1),
-        (-1, 2),
-    ])
+    jump_table(&[(1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)])
 }
 
 const fn king_table() -> [Bitboard; 64] {
     // The eight neighbours: every (df, dr) in {-1,0,1}² except (0,0).
-    jump_table(&[
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-        (-1, 0),
-        (1, 0),
-        (-1, 1),
-        (0, 1),
-        (1, 1),
-    ])
+    jump_table(&[(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)])
 }
 
 /// Build the pawn capture table for one color. `rank_delta` is +1 for White
@@ -595,8 +577,7 @@ mod tests {
     #[test]
     fn queen_is_rook_union_bishop() {
         let occupied = occ(&["d6", "f4", "b2"]);
-        let expected =
-            rook_attacks(sq("d4"), occupied).union(bishop_attacks(sq("d4"), occupied));
+        let expected = rook_attacks(sq("d4"), occupied).union(bishop_attacks(sq("d4"), occupied));
         assert_eq!(queen_attacks(sq("d4"), occupied), expected);
         // On an empty board the center queen reaches 14 (rook) + 13 (bishop) = 27.
         assert_eq!(queen_attacks(sq("d4"), Bitboard::EMPTY).count(), 27);
@@ -618,10 +599,7 @@ mod tests {
     #[test]
     fn perft1_matches_standard_positions() {
         // Startpos: the canonical 20 opening moves (16 pawn + 4 knight).
-        assert_eq!(
-            legal_count("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
-            20
-        );
+        assert_eq!(legal_count("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"), 20);
         // Kiwipete — castling, pins, and captures all live: 48.
         assert_eq!(
             legal_count("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
@@ -700,10 +678,7 @@ mod tests {
         assert!(!moves.is_empty());
         let mut work = b.clone();
         for &mv in &moves {
-            assert!(
-                leaves_king_safe(&mut work, Color::Black, mv),
-                "{mv} leaves the king in check"
-            );
+            assert!(leaves_king_safe(&mut work, Color::Black, mv), "{mv} leaves the king in check");
         }
     }
 

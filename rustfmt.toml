@@ -1,0 +1,6 @@
+# Match the codebase's hand-tuned ~100-column style. `use_small_heuristics =
+# "Max"` makes rustfmt only wrap lines that genuinely exceed `max_width`, instead
+# of breaking calls/tuples/asserts on its much narrower default sub-heuristics —
+# so formatting stays a no-op on the existing code rather than reflowing it.
+max_width = 100
+use_small_heuristics = "Max"

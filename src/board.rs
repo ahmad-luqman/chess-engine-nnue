@@ -203,11 +203,8 @@ impl Board {
 
         // Remove the captured piece, if any. En-passant's victim is beside the
         // mover (destination file, origin rank), never on `to`.
-        let captured_square = if mv.is_en_passant() {
-            Square::from_file_rank(to.file(), from.rank())
-        } else {
-            to
-        };
+        let captured_square =
+            if mv.is_en_passant() { Square::from_file_rank(to.file(), from.rank()) } else { to };
         let captured = self.remove_piece(captured_square);
         if let Some(victim) = captured {
             hash ^= piece_key(victim, captured_square);
@@ -250,11 +247,8 @@ impl Board {
             ^ zobrist::KEYS.castling[self.castling.0 as usize];
 
         // The fifty-move clock resets on any pawn move or capture, else ticks up.
-        self.halfmove_clock = if is_pawn || captured.is_some() {
-            0
-        } else {
-            self.halfmove_clock + 1
-        };
+        self.halfmove_clock =
+            if is_pawn || captured.is_some() { 0 } else { self.halfmove_clock + 1 };
 
         // Hand over to the opponent; the move number counts completed Black moves.
         self.side_to_move = us.flip();

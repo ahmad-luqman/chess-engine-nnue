@@ -115,6 +115,10 @@ fn pst_index(color: Color, sq: Square) -> usize {
 /// perspective; Black reuses them mirrored (again, see [`pst_index`]). A single
 /// king table (middlegame) is used for now — game-phase tapering (an endgame
 /// king table that walks the king toward the centre) is a later refinement.
+///
+/// `rustfmt::skip` keeps each table laid out as a readable 8×8 board (rank per
+/// line); without it rustfmt collapses them into an unreadable flat run.
+#[rustfmt::skip]
 const PIECE_SQUARE_TABLE: [[i32; 64]; 6] = [
     // Pawn — reward central advances; discourage the f2/g2 squares weakening.
     [
