@@ -22,3 +22,5 @@
 
 # Match-runner (fastchess/cutechess) artifacts written into the working dir.
 /config.json
+# Stashed baseline engine binary (the tagged-release SPRT opponent).
+/baseline/
