@@ -143,18 +143,20 @@ pub fn pawn_attacks(color: Color, sq: Square) -> Bitboard {
 
 // ── Sliding attacks (rook, bishop, queen) ───────────────────────────────────
 //
-// Unlike the tables above, a slider's reach depends on what blocks it, so these
-// are computed per call against an `occupied` bitboard. The method here is the
-// straightforward "walk the ray" loop — correct and obvious, but it touches the
-// board square by square. Phase 2 replaces it with magic bitboards (one
-// multiply + table lookup) once perft proves this version correct; that's the
-// deliberate "correct first, fast later" ordering from the iron rules.
+// Unlike the tables above, a slider's reach depends on what blocks it. The
+// geometry oracle is the straightforward "walk the ray" loop ([`ray_attacks`]):
+// correct and obvious, but it touches the board square by square. The public
+// `rook_attacks`/`bishop_attacks` now delegate to **magic bitboards** (one
+// multiply + table lookup, see `crate::magic`), which `ray_attacks` still backs
+// — it builds and verifies the magic tables. This is the "correct first, fast
+// later" ordering from the iron rules: perft proved the ray loop, and magics are
+// a drop-in that perft must still match exactly (issue #27).
 
 /// Rook ray directions as `(file_step, rank_step)`: along ranks and files.
-const ROOK_DIRS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+pub(crate) const ROOK_DIRS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 
 /// Bishop ray directions: the four diagonals.
-const BISHOP_DIRS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+pub(crate) const BISHOP_DIRS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
 
 /// Walk each ray out from `sq` until the board edge or the first occupied
 /// square, unioning every square reached.
@@ -165,7 +167,7 @@ const BISHOP_DIRS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
 /// the move generator (issue #15) masks off blockers of the *mover's own*
 /// color afterward. Keeping that decision out of here is what lets one function
 /// serve both attack detection and capture generation.
-fn ray_attacks(sq: Square, occupied: Bitboard, dirs: &[(i8, i8)]) -> Bitboard {
+pub(crate) fn ray_attacks(sq: Square, occupied: Bitboard, dirs: &[(i8, i8)]) -> Bitboard {
     let mut bb = Bitboard::EMPTY;
     let start_file = sq.file() as i8;
     let start_rank = sq.rank() as i8;
@@ -188,13 +190,17 @@ fn ray_attacks(sq: Square, occupied: Bitboard, dirs: &[(i8, i8)]) -> Bitboard {
 }
 
 /// Squares a rook on `sq` attacks given the board `occupied` set.
+///
+/// Drop-in over magic bitboards; identical result to `ray_attacks(sq, occupied,
+/// &ROOK_DIRS)` but a single multiply-shift-index instead of a per-square walk.
 pub fn rook_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
-    ray_attacks(sq, occupied, &ROOK_DIRS)
+    crate::magic::rook_attacks(sq, occupied)
 }
 
-/// Squares a bishop on `sq` attacks given the board `occupied` set.
+/// Squares a bishop on `sq` attacks given the board `occupied` set. Drop-in over
+/// magic bitboards (see [`rook_attacks`]).
 pub fn bishop_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
-    ray_attacks(sq, occupied, &BISHOP_DIRS)
+    crate::magic::bishop_attacks(sq, occupied)
 }
 
 /// Squares a queen on `sq` attacks — the union of rook and bishop rays, since a
