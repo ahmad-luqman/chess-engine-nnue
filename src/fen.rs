@@ -165,6 +165,10 @@ impl FromStr for Board {
         board.halfmove_clock = fields[4].parse().map_err(|_| ParseFenError::BadHalfmove)?;
         board.fullmove_number = fields[5].parse().map_err(|_| ParseFenError::BadFullmove)?;
 
+        // `put_piece` and the field assignments above are hash-agnostic, so seed
+        // the Zobrist key from scratch now that the position is fully built.
+        board.hash = crate::zobrist::compute(&board);
+
         Ok(board)
     }
 }

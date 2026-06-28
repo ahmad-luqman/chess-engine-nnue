@@ -8,8 +8,16 @@
 //! which is why perft (issue #17) exists to catch them.
 
 use crate::bitboard::Bitboard;
+use crate::movegen::pawn_attacks;
 use crate::moves::{Move, MoveFlag};
 use crate::types::{Color, Piece, PieceType, Square};
+use crate::zobrist;
+
+/// The Zobrist key for `piece` standing on `sq` — the per-feature constant that
+/// gets XORed in when the piece arrives and out when it leaves.
+fn piece_key(piece: Piece, sq: Square) -> u64 {
+    zobrist::KEYS.piece[piece.color.index()][piece.piece_type.index()][sq.0 as usize]
+}
 
 /// Castling availability as four independent flags packed into a `u8`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -37,14 +45,18 @@ impl CastlingRights {
 /// recompute: the captured piece (if any), and the castling rights, en-passant
 /// square, and halfmove clock as they were *before* the move. Everything else
 /// (the moving piece, the side to move, the move number) is recoverable from the
-/// move itself, so it is not stored. (A Zobrist key will join this struct when
-/// the transposition table arrives in Phase 2.)
+/// move itself, so it is not stored.
+///
+/// The pre-move Zobrist `hash` rides along too: rather than replay the move's
+/// XORs in reverse, `unmake_move` simply restores this snapshot in O(1) — the
+/// struct already exists to carry exactly this kind of un-recomputable state.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Undo {
     captured: Option<Piece>,
     castling: CastlingRights,
     ep_square: Option<Square>,
     halfmove_clock: u16,
+    hash: u64,
 }
 
 /// The rook's `(from, to)` squares for a castling move, derived from the king's
@@ -91,6 +103,11 @@ pub struct Board {
     pub ep_square: Option<Square>,
     pub halfmove_clock: u16,
     pub fullmove_number: u16,
+    /// Incrementally maintained Zobrist key (see `crate::zobrist`). Updated in
+    /// `make_move`, snapshot-restored in `unmake_move`, and seeded from scratch
+    /// by the FEN parser. Cheap collision-resistant identity for the TT (#24)
+    /// and repetition detection (#28).
+    pub hash: u64,
 }
 
 impl Board {
@@ -106,6 +123,7 @@ impl Board {
             ep_square: None,
             halfmove_clock: 0,
             fullmove_number: 1,
+            hash: 0,
         }
     }
 
@@ -169,19 +187,31 @@ impl Board {
             castling: self.castling,
             ep_square: self.ep_square,
             halfmove_clock: self.halfmove_clock,
+            hash: self.hash, // pre-move snapshot; unmake restores it verbatim
         };
 
+        // Maintain the Zobrist key incrementally: every board feature this move
+        // touches is XORed out of `hash` as it leaves and in as it arrives.
+        let mut hash = self.hash;
+        // Drop the old en-passant contribution first (it reads the *current* ep
+        // square and side to move); the new one is added at the end.
+        hash ^= self.ep_zobrist();
+
         let moving = self.remove_piece(from).expect("a move originates on an occupied square");
+        hash ^= piece_key(moving, from);
         let is_pawn = moving.piece_type == PieceType::Pawn;
 
         // Remove the captured piece, if any. En-passant's victim is beside the
         // mover (destination file, origin rank), never on `to`.
-        let captured = if mv.is_en_passant() {
-            let victim = Square::from_file_rank(to.file(), from.rank());
-            self.remove_piece(victim)
+        let captured_square = if mv.is_en_passant() {
+            Square::from_file_rank(to.file(), from.rank())
         } else {
-            self.remove_piece(to)
+            to
         };
+        let captured = self.remove_piece(captured_square);
+        if let Some(victim) = captured {
+            hash ^= piece_key(victim, captured_square);
+        }
 
         // Place the moving piece, swapping in the promoted piece if promoting.
         let placed = match mv.promotion_piece() {
@@ -189,12 +219,15 @@ impl Board {
             None => moving,
         };
         self.put_piece(to, placed);
+        hash ^= piece_key(placed, to);
 
         // Relocate the rook on a castle (the king's own move is already done).
         if mv.is_castle() {
             let (rook_from, rook_to) = castle_rook_squares(mv);
             let rook = self.remove_piece(rook_from).expect("a castling rook is present");
+            hash ^= piece_key(rook, rook_from);
             self.put_piece(rook_to, rook);
+            hash ^= piece_key(rook, rook_to);
         }
 
         // A double pawn push (and nothing else) sets the en-passant square — the
@@ -208,8 +241,13 @@ impl Board {
         // Castling rights fall away when a king or rook leaves its home square,
         // or when a rook is captured on its home square — covered by masking on
         // both `from` and `to`.
+        let old_castling = self.castling;
         self.castling =
             CastlingRights(self.castling.0 & !(castling_loss_mask(from) | castling_loss_mask(to)));
+        // One XOR-out/XOR-in over the 16-entry table; a no-op when rights are
+        // unchanged (the two entries are identical, so they cancel).
+        hash ^= zobrist::KEYS.castling[old_castling.0 as usize]
+            ^ zobrist::KEYS.castling[self.castling.0 as usize];
 
         // The fifty-move clock resets on any pawn move or capture, else ticks up.
         self.halfmove_clock = if is_pawn || captured.is_some() {
@@ -220,9 +258,18 @@ impl Board {
 
         // Hand over to the opponent; the move number counts completed Black moves.
         self.side_to_move = us.flip();
+        hash ^= zobrist::KEYS.side;
         if us == Color::Black {
             self.fullmove_number += 1;
         }
+
+        // Add the new en-passant contribution now that the ep square, side to
+        // move, and pawn positions are all final.
+        hash ^= self.ep_zobrist();
+        self.hash = hash;
+        // The incrementally maintained key must always equal a from-scratch
+        // recomputation; a mismatch means a feature toggle was missed above.
+        debug_assert_eq!(self.hash, zobrist::compute(self), "incremental hash drifted");
 
         Undo { captured, ..prev }
     }
@@ -270,6 +317,35 @@ impl Board {
         self.castling = undo.castling;
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
+        // XOR is invertible, so we *could* replay the move's key deltas; storing
+        // the pre-move key and restoring it is simpler and O(1).
+        self.hash = undo.hash;
+    }
+
+    /// The Zobrist contribution of the en-passant square, which is **nonzero
+    /// only when the side to move can actually capture en passant** — i.e. a
+    /// pawn of theirs sits on a square attacking `ep_square`.
+    ///
+    /// This "capturable-only" rule is what lets transposed positions share a
+    /// key: after `1.Nf3 e5 2.e4` the ep square is e3 but no black pawn can take
+    /// it, so it must hash identically to `1.e4 e5 2.Nf3` (where Nf3 cleared the
+    /// ep square entirely). Hashing on `ep_square.is_some()` alone would break
+    /// that. `compute` and `make_move` both route through here, so they agree by
+    /// construction.
+    pub(crate) fn ep_zobrist(&self) -> u64 {
+        match self.ep_square {
+            Some(ep) if self.ep_capturable(ep) => zobrist::KEYS.ep_file[ep.file() as usize],
+            _ => 0,
+        }
+    }
+
+    /// Whether the side to move has a pawn positioned to capture on `ep`.
+    /// Pawn attacks are symmetric in reverse: the squares a side-to-move pawn
+    /// could attack `ep` *from* are exactly `pawn_attacks(enemy_color, ep)`.
+    fn ep_capturable(&self, ep: Square) -> bool {
+        let us = self.side_to_move;
+        let our_pawns = self.pieces(PieceType::Pawn).intersect(self.color(us));
+        !pawn_attacks(us.flip(), ep).intersect(our_pawns).is_empty()
     }
 }
 
@@ -361,4 +437,59 @@ mod tests {
         }
     }
 
+    // ── Zobrist hashing (issue #23) ─────────────────────────────────────────
+
+    /// Play the (assumed legal) move from `from` to `to` on `board`.
+    fn play(board: &mut Board, from: &str, to: &str) {
+        let from = Square::from_str(from).unwrap();
+        let to = Square::from_str(to).unwrap();
+        let mv = generate_legal(board)
+            .into_iter()
+            .find(|m| m.from() == from && m.to() == to)
+            .expect("a legal move between the given squares");
+        board.make_move(mv);
+    }
+
+    #[test]
+    fn transposed_move_orders_reach_the_same_hash() {
+        // The canonical test: 1.e4 e5 2.Nf3 and 1.Nf3 e5 2.e4 reach the same
+        // position, so they must share a Zobrist key. The two differ in their
+        // halfmove clock (not hashed) and in a *non-capturable* ep square after
+        // the e4-last order (not hashed, thanks to the capturable-only rule), so
+        // the boards are not bit-for-bit equal — only the hashes are.
+        let mut a = board(STARTPOS);
+        play(&mut a, "e2", "e4");
+        play(&mut a, "e7", "e5");
+        play(&mut a, "g1", "f3");
+
+        let mut b = board(STARTPOS);
+        play(&mut b, "g1", "f3");
+        play(&mut b, "e7", "e5");
+        play(&mut b, "e2", "e4");
+
+        assert_eq!(a.hash, b.hash, "transposed positions must share a hash");
+    }
+
+    #[test]
+    fn incremental_hash_matches_from_scratch_across_perft() {
+        // Walk the move tree and assert the maintained key equals a fresh
+        // recomputation at every node. (The same check runs as a debug_assert
+        // inside make_move; this makes it an explicit, named guarantee.)
+        fn walk(board: &mut Board, depth: u32) {
+            assert_eq!(board.hash, crate::zobrist::compute(board));
+            if depth == 0 {
+                return;
+            }
+            for mv in generate_legal(board) {
+                let undo = board.make_move(mv);
+                walk(board, depth - 1);
+                board.unmake_move(mv, undo);
+                // unmake must put the key back exactly.
+                assert_eq!(board.hash, crate::zobrist::compute(board));
+            }
+        }
+        for fen in [STARTPOS, KIWIPETE, POS3, POS4, POS5, EP_POS] {
+            walk(&mut board(fen), 3);
+        }
+    }
 }
