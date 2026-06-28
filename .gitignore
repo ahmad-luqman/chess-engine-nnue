@@ -25,5 +25,8 @@
 
 # Match-runner (fastchess/cutechess) artifacts written into the working dir.
 /config.json
+# SPRT runner (scripts/sprt.sh) tee'd log + PGN (PGN also matches *.pgn above).
+/sprt.log
+/sprt.pgn
 # Stashed baseline engine binary (the tagged-release SPRT opponent).
 /baseline/

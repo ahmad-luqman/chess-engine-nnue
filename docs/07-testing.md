@@ -77,13 +77,33 @@ engine vs itself, did exactly this: 87 plies ending in checkmate.)
 SPRT plays games until it can conclude (with bounded error) whether the new build
 gained Elo, then stops — far more efficient than a fixed N games.
 
+**One command** ([`scripts/sprt.sh`](../scripts/sprt.sh), issue #33) wraps the whole
+recipe — build the candidate, obtain the baseline opponent, ensure the book, run
+the match, and print the LLR / Elo / accept-reject verdict:
+
+```
+scripts/sprt.sh v0.5.0              # candidate vs the v0.5.0 baseline at tc=5+0.05
+scripts/sprt.sh v0.5.0 8+0.08       # ... at a slower time control
+scripts/sprt.sh baseline/engine     # ... vs an already-built binary (skip the tag rebuild)
+```
+
+The baseline argument is either a **git tag** — built fresh in a throwaway git
+worktree and stashed at `baseline/engine`, so it's exactly reproducible from
+version control — or a **path** to an existing binary, used as-is. Bounds and
+match size are env-overridable (`ELO0 ELO1 ALPHA BETA ROUNDS GAMES CONCURRENCY
+BOOK`); the verdict is decided from the final `LLR` against its bounds
+(`±2.94` for `alpha=beta=0.05`): `PASS` (H1, promote), `FAIL` (H0, revert), or
+`INCONCLUSIVE` (raise `ROUNDS`). The exit code is non-zero on `FAIL`.
+
+Under the hood it runs exactly this fastchess invocation:
+
 ```
 fastchess \
   -engine cmd=./target/release/engine name=new \
   -engine cmd=./baseline/engine        name=base \
-  -each proto=uci tc=8+0.08 \
+  -each proto=uci tc=5+0.05 \
   -openings file=books/openings.epd format=epd order=random \
-  -repeat -rounds 5000 -games 2 -concurrency 4 \
+  -repeat -rounds 5000 -games 2 -concurrency 8 \
   -sprt elo0=0 elo1=5 alpha=0.05 beta=0.05 \
   -pgnout file=sprt.pgn
 ```
@@ -111,8 +131,8 @@ fastchess \
 
 1. Make one change.
 2. `cargo test` + `cargo clippy` — correctness.
-3. SPRT vs the previous tagged build — strength.
-4. Keep the change only if SPRT passes; otherwise revert.
+3. `scripts/sprt.sh <prev-tag>` — strength vs the previous tagged build.
+4. Keep the change only if SPRT reports `PASS`; otherwise revert.
 5. When a gainer lands, **tag a release** and rebuild the baseline from it, so
    there's always an opponent to measure the next change against.
 
