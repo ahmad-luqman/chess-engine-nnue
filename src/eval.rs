@@ -37,7 +37,11 @@
 
 use std::ops::{Add, AddAssign, Neg, Sub};
 
+use crate::bitboard::Bitboard;
 use crate::board::Board;
+use crate::movegen::{
+    bishop_attacks, king_attacks, king_square, knight_attacks, queen_attacks, rook_attacks,
+};
 use crate::types::{Color, PieceType, Square};
 
 /// A packed middlegame/endgame score pair. Terms accumulate as `Score`s and are
@@ -137,13 +141,9 @@ impl Evaluator for Material {
 fn side_score(board: &Board, color: Color) -> Score {
     let own = board.color(color);
     let mut total = Score::default();
-    for pt in [
-        PieceType::Pawn,
-        PieceType::Knight,
-        PieceType::Bishop,
-        PieceType::Rook,
-        PieceType::Queen,
-    ] {
+    for pt in
+        [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen]
+    {
         let table = &PIECE_SQUARE_TABLE[pt.index()];
         let value = PIECE_VALUE[pt.index()];
         let mut bb = board.pieces(pt).intersect(own);
@@ -159,8 +159,276 @@ fn side_score(board: &Board, color: Color) -> Score {
         let idx = pst_index(color, sq);
         total += Score { mg: KING_MG[idx], eg: KING_EG[idx] };
     }
+
+    // Hand-crafted positional terms (issue #41), each isolated so Texel (#42) can
+    // tune its weight independently.
+    total += bishop_pair(board, color);
+    total += rook_files(board, color);
+    total += mobility(board, color);
+    total += pawn_structure(board, color);
+    total += king_safety(board, color);
+
     total
 }
+
+// ── Hand-crafted terms (issue #41) ──────────────────────────────────────────
+//
+// Each term returns a tapered `(mg, eg)` [`Score`] *for `color`* (positive = good
+// for that side), accumulated into [`side_score`]. Weights here are textbook
+// starting points; Texel tuning (#42) optimises them. New terms are added one at a
+// time, each SPRT-gated, so a regression is attributable to a single term.
+
+/// Bonus for holding the **bishop pair**: two bishops cover both colour complexes
+/// and are worth more than the sum of the parts, especially in open endgames — so
+/// the endgame weight is the larger of the two. Awarded once a side has ≥ 2
+/// bishops (the common case is exactly two; more only arise via promotion).
+const BISHOP_PAIR: Score = Score { mg: 30, eg: 45 };
+
+fn bishop_pair(board: &Board, color: Color) -> Score {
+    let bishops = board.pieces(PieceType::Bishop).intersect(board.color(color));
+    if bishops.count() >= 2 {
+        BISHOP_PAIR
+    } else {
+        Score::default()
+    }
+}
+
+/// Bonus for a rook on an **open** file (no pawn of either colour) or a
+/// **semi-open** file (no *friendly* pawn, but an enemy pawn present). Open files
+/// are a rook's highways into the enemy position; the bonus is larger in the
+/// middlegame, when there is more along the file to pressure.
+const ROOK_OPEN_FILE: Score = Score { mg: 25, eg: 10 };
+const ROOK_SEMI_OPEN_FILE: Score = Score { mg: 12, eg: 5 };
+
+fn rook_files(board: &Board, color: Color) -> Score {
+    let own_pawns = board.pieces(PieceType::Pawn).intersect(board.color(color));
+    let enemy_pawns = board.pieces(PieceType::Pawn).intersect(board.color(color.flip()));
+    let mut total = Score::default();
+    let mut rooks = board.pieces(PieceType::Rook).intersect(board.color(color));
+    while let Some(sq) = rooks.pop_lsb() {
+        let file = FILE_MASKS[sq.file() as usize];
+        if own_pawns.intersect(file).is_empty() {
+            total += if enemy_pawns.intersect(file).is_empty() {
+                ROOK_OPEN_FILE
+            } else {
+                ROOK_SEMI_OPEN_FILE
+            };
+        }
+    }
+    total
+}
+
+/// Mobility: a small bonus per square a piece attacks that isn't occupied by one
+/// of its own pieces. More squares ≈ a more active piece. Weighted per piece type
+/// and phase — rooks value lines more in the endgame; the queen is weighted lightly
+/// so its huge reach doesn't swamp the term. This is cheap *pseudo*-mobility (it
+/// doesn't exclude enemy-controlled squares); eval runs at every qsearch leaf, so
+/// the attack lookups are kept to one per piece. Indexed by [`PieceType::index`].
+const MOBILITY: [Score; 6] = [
+    Score { mg: 0, eg: 0 }, // Pawn — not counted
+    Score { mg: 4, eg: 4 }, // Knight
+    Score { mg: 4, eg: 4 }, // Bishop
+    Score { mg: 2, eg: 4 }, // Rook
+    Score { mg: 1, eg: 2 }, // Queen
+    Score { mg: 0, eg: 0 }, // King — not counted
+];
+
+fn mobility(board: &Board, color: Color) -> Score {
+    let own = board.color(color);
+    let occ = board.occupied();
+    let mut total = Score::default();
+    for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+        let w = MOBILITY[pt.index()];
+        let mut bb = board.pieces(pt).intersect(own);
+        while let Some(sq) = bb.pop_lsb() {
+            let attacks = match pt {
+                PieceType::Knight => knight_attacks(sq),
+                PieceType::Bishop => bishop_attacks(sq, occ),
+                PieceType::Rook => rook_attacks(sq, occ),
+                PieceType::Queen => queen_attacks(sq, occ),
+                _ => unreachable!(),
+            };
+            let n = attacks.minus(own).count() as i32;
+            total += Score { mg: w.mg * n, eg: w.eg * n };
+        }
+    }
+    total
+}
+
+/// Pawn-structure penalties and bonuses. **Doubled** (two+ pawns on a file) and
+/// **isolated** (no friendly pawn on an adjacent file) are weaknesses — they can't
+/// defend each other and are easy to blockade — so they score negative.
+/// **Passed** pawns (no enemy pawn ahead on the same or adjacent files) are
+/// strong, more so the closer to promotion and the deeper into the endgame, so the
+/// bonus rises with rank and tapers toward `eg`.
+const DOUBLED_PAWN: Score = Score { mg: -10, eg: -20 };
+const ISOLATED_PAWN: Score = Score { mg: -12, eg: -8 };
+/// Passed-pawn bonus indexed by the pawn's rank *from its own side* (0 = home rank,
+/// 6 = one step from promotion). Index 0 and 7 are unreachable for a pawn.
+const PASSED_PAWN_MG: [i32; 8] = [0, 5, 10, 15, 25, 40, 60, 0];
+const PASSED_PAWN_EG: [i32; 8] = [0, 10, 15, 25, 40, 65, 100, 0];
+
+fn pawn_structure(board: &Board, color: Color) -> Score {
+    let own_pawns = board.pieces(PieceType::Pawn).intersect(board.color(color));
+    let enemy_pawns = board.pieces(PieceType::Pawn).intersect(board.color(color.flip()));
+    let mut total = Score::default();
+
+    // Doubled: every pawn beyond the first on a file is a doubled pawn.
+    for file in FILE_MASKS {
+        let n = own_pawns.intersect(file).count() as i32;
+        if n > 1 {
+            total += Score { mg: DOUBLED_PAWN.mg * (n - 1), eg: DOUBLED_PAWN.eg * (n - 1) };
+        }
+    }
+
+    let mut pawns = own_pawns;
+    while let Some(sq) = pawns.pop_lsb() {
+        // Isolated: no friendly pawn on either adjacent file (the pawn's own file
+        // is excluded from the mask, so it never matches itself).
+        if own_pawns.intersect(ADJACENT_FILE_MASKS[sq.file() as usize]).is_empty() {
+            total += ISOLATED_PAWN;
+        }
+        // Passed: no enemy pawn on the same or adjacent files anywhere ahead.
+        if enemy_pawns.intersect(PASSED_MASKS[color.index()][sq.0 as usize]).is_empty() {
+            let rel = match color {
+                Color::White => sq.rank() as usize,
+                Color::Black => 7 - sq.rank() as usize,
+            };
+            total += Score { mg: PASSED_PAWN_MG[rel], eg: PASSED_PAWN_EG[rel] };
+        }
+    }
+    total
+}
+
+/// King safety: a **middlegame-only** penalty for enemy pressure on the king's
+/// neighbourhood. Two cheap, well-behaved signals (kept conservative — an
+/// over-eager king-safety term is the classic source of eval regressions; Texel
+/// #42 can sharpen it): **zone pressure** (a weighted count of enemy pieces
+/// attacking the king ring) and **shield holes** (files beside the king, king
+/// file ± 1, with no friendly pawn — open avenues toward the king).
+///
+/// `eg == 0`: in the endgame the king is a fighting piece, not a target (the
+/// counterpart to the centralising [`KING_EG`] table).
+const KING_ATTACK_WEIGHT: [i32; 6] = [0, 2, 2, 3, 5, 0]; // P,N,B,R,Q,K
+const KING_DANGER_PER_UNIT: i32 = 4;
+const PAWN_SHIELD_HOLE: i32 = 12;
+
+fn king_safety(board: &Board, color: Color) -> Score {
+    let king_sq = king_square(board, color);
+    let zone = king_attacks(king_sq).with(king_sq);
+    let occ = board.occupied();
+    let enemy = color.flip();
+
+    // Zone pressure: each enemy piece that attacks into the king ring adds its
+    // weight in "attack units".
+    let mut units = 0;
+    for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+        let mut bb = board.pieces(pt).intersect(board.color(enemy));
+        while let Some(sq) = bb.pop_lsb() {
+            let attacks = match pt {
+                PieceType::Knight => knight_attacks(sq),
+                PieceType::Bishop => bishop_attacks(sq, occ),
+                PieceType::Rook => rook_attacks(sq, occ),
+                PieceType::Queen => queen_attacks(sq, occ),
+                _ => unreachable!(),
+            };
+            if !attacks.intersect(zone).is_empty() {
+                units += KING_ATTACK_WEIGHT[pt.index()];
+            }
+        }
+    }
+
+    // Shield holes: open files immediately around the king.
+    let own_pawns = board.pieces(PieceType::Pawn).intersect(board.color(color));
+    let kf = king_sq.file() as usize;
+    let mut holes = 0;
+    for file in &FILE_MASKS[kf.saturating_sub(1)..=(kf + 1).min(7)] {
+        if own_pawns.intersect(*file).is_empty() {
+            holes += 1;
+        }
+    }
+
+    Score { mg: -(units * KING_DANGER_PER_UNIT + holes * PAWN_SHIELD_HOLE), eg: 0 }
+}
+
+// ── File / pawn masks (issue #41) ───────────────────────────────────────────
+//
+// Precomputed at compile time via `const fn` (no runtime cost, no init step).
+// Square index is `rank * 8 + file` with a1 = 0 (see `src/bitboard.rs`).
+
+/// `FILE_MASKS[f]` is every square on file `f` (a = 0 … h = 7). Used for rook
+/// open/semi-open files and for doubled/isolated pawn detection (#41).
+const FILE_MASKS: [Bitboard; 8] = {
+    let mut masks = [Bitboard(0); 8];
+    let mut f = 0;
+    while f < 8 {
+        let mut bb = 0u64;
+        let mut r = 0;
+        while r < 8 {
+            bb |= 1u64 << (r * 8 + f);
+            r += 1;
+        }
+        masks[f] = Bitboard(bb);
+        f += 1;
+    }
+    masks
+};
+
+/// `ADJACENT_FILE_MASKS[f]` is the files immediately left and right of `f` (not `f`
+/// itself). A pawn on file `f` is **isolated** when no friendly pawn intersects it.
+const ADJACENT_FILE_MASKS: [Bitboard; 8] = {
+    let mut m = [Bitboard(0); 8];
+    let mut f = 0;
+    while f < 8 {
+        let mut bb = 0u64;
+        if f > 0 {
+            bb |= FILE_MASKS[f - 1].0;
+        }
+        if f < 7 {
+            bb |= FILE_MASKS[f + 1].0;
+        }
+        m[f] = Bitboard(bb);
+        f += 1;
+    }
+    m
+};
+
+/// `PASSED_MASKS[color][sq]` is every square on `sq`'s file and the two adjacent
+/// files that lies **strictly ahead** of `sq` from `color`'s direction of travel
+/// (White toward rank 8, Black toward rank 1). A pawn is **passed** when no enemy
+/// pawn occupies its mask — nothing can block it or capture it on the way to
+/// promotion. Indexed `[Color::index()][Square::0]`.
+const PASSED_MASKS: [[Bitboard; 64]; 2] = {
+    let mut masks = [[Bitboard(0); 64]; 2];
+    let mut sq = 0;
+    while sq < 64 {
+        let file = sq % 8;
+        let rank = sq / 8;
+        let lo = if file == 0 { 0 } else { file - 1 };
+        let hi = if file == 7 { 7 } else { file + 1 };
+        let mut white = 0u64;
+        let mut black = 0u64;
+        let mut f = lo;
+        while f <= hi {
+            // White: every rank above this one. Black: every rank below.
+            let mut r = rank + 1;
+            while r < 8 {
+                white |= 1u64 << (r * 8 + f);
+                r += 1;
+            }
+            let mut r2 = 0;
+            while r2 < rank {
+                black |= 1u64 << (r2 * 8 + f);
+                r2 += 1;
+            }
+            f += 1;
+        }
+        masks[0][sq] = Bitboard(white);
+        masks[1][sq] = Bitboard(black);
+        sq += 1;
+    }
+    masks
+};
 
 /// Full-material game phase, the highest value [`game_phase`] returns.
 const PHASE_MAX: i32 = 24;
@@ -326,11 +594,14 @@ mod tests {
 
     #[test]
     fn score_is_side_to_move_relative() {
-        // A lone white rook vs bare kings (kings on mirror squares, rook on a1
-        // with a zero PST entry) is +500 for White, -500 for Black — the same
-        // position scored from whichever seat is to move.
-        assert_eq!(eval("4k3/8/8/8/8/8/8/R3K3 w - - 0 1"), 500);
-        assert_eq!(eval("4k3/8/8/8/8/8/8/R3K3 b - - 0 1"), -500);
+        // The same position scored from each seat must negate — that sign-flip is
+        // the invariant. The exact magnitude is incidental (material + PST + the
+        // positional terms; the lone rook here also sits on an open file), so we
+        // assert symmetry plus a clearly-winning score rather than an exact number.
+        let w = eval("4k3/8/8/8/8/8/8/R3K3 w - - 0 1");
+        let b = eval("4k3/8/8/8/8/8/8/R3K3 b - - 0 1");
+        assert_eq!(w, -b, "side-to-move score must negate between seats");
+        assert!(w > 400, "white up a rook should be clearly winning, got {w}");
     }
 
     #[test]
@@ -387,5 +658,184 @@ mod tests {
         assert_eq!(s.taper(PHASE_MAX), 100); // full material → pure middlegame
         assert_eq!(s.taper(0), -20); //         bare board     → pure endgame
         assert_eq!(s.taper(12), (100 * 12 + -20 * 12) / 24); // halfway blend
+    }
+
+    // ── Hand-crafted terms (issue #41) ──────────────────────────────────────
+
+    #[test]
+    fn bishop_pair_beats_no_pair_all_else_equal() {
+        // Two bishops vs bishop+knight: same material (B≈N here) and mirrored
+        // placement, so the *only* difference is the pair bonus. The side holding
+        // both bishops must score better. White has two bishops (c1, f1); Black has
+        // a knight on b8 instead of one bishop.
+        let pair = eval("rn1qkb1r/pppppppp/8/8/8/8/PPPPPPPP/R1BQKB1R w KQkq - 0 1");
+        // Mirror: now White also has a knight instead of the c1 bishop → no pair.
+        let no_pair = eval("rn1qkb1r/pppppppp/8/8/8/8/PPPPPPPP/RN1QKB1R w KQkq - 0 1");
+        assert!(pair > no_pair, "bishop pair {pair} should beat no pair {no_pair}");
+    }
+
+    #[test]
+    fn bishop_pair_term_is_a_nonnegative_bonus() {
+        // Direct sign/structure check: the term is 0 with one bishop and positive
+        // with two, never a penalty.
+        let one = Board::from_str("4k3/8/8/8/8/8/8/2B1K3 w - - 0 1").unwrap();
+        let two = Board::from_str("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1").unwrap();
+        assert_eq!(bishop_pair(&one, Color::White), Score::default());
+        assert_eq!(bishop_pair(&two, Color::White), BISHOP_PAIR);
+    }
+
+    #[test]
+    fn file_masks_cover_each_file() {
+        // a-file is squares a1..a8 = bits 0,8,16,…,56.
+        assert_eq!(FILE_MASKS[0], Bitboard(0x0101_0101_0101_0101));
+        // h-file is the a-file shifted left 7.
+        assert_eq!(FILE_MASKS[7], Bitboard(0x8080_8080_8080_8080));
+        // Each file has exactly 8 squares and they partition the board.
+        let mut all = Bitboard(0);
+        for file in FILE_MASKS {
+            assert_eq!(file.count(), 8);
+            all = all.union(file);
+        }
+        assert_eq!(all, Bitboard(u64::MAX));
+    }
+
+    #[test]
+    fn rook_on_open_file_beats_a_blocked_rook() {
+        // White rook on the open d-file (no pawns on it) vs a rook on the closed
+        // a-file (own pawn on a2). Same material; the open-file bonus must make the
+        // open-file placement score higher.
+        let open = eval("4k3/8/8/8/8/8/P7/3RK3 w - - 0 1");
+        let blocked = eval("4k3/8/8/8/8/8/P7/R3K3 w - - 0 1");
+        assert!(open > blocked, "rook on open file {open} should beat blocked {blocked}");
+    }
+
+    #[test]
+    fn rook_file_bonus_grades_open_over_semi_over_closed() {
+        // A single white rook on the d-file under three pawn configurations:
+        //   open      — no pawns on d
+        //   semi-open — only an enemy (black) pawn on d
+        //   closed    — a friendly (white) pawn on d
+        let open =
+            rook_files(&Board::from_str("4k3/8/8/8/8/8/8/3RK3 w - - 0 1").unwrap(), Color::White);
+        let semi =
+            rook_files(&Board::from_str("4k3/3p4/8/8/8/8/8/3RK3 w - - 0 1").unwrap(), Color::White);
+        let closed =
+            rook_files(&Board::from_str("4k3/8/8/8/8/8/3P4/3RK3 w - - 0 1").unwrap(), Color::White);
+        assert_eq!(open, ROOK_OPEN_FILE);
+        assert_eq!(semi, ROOK_SEMI_OPEN_FILE);
+        assert_eq!(closed, Score::default());
+    }
+
+    #[test]
+    fn mobility_rewards_active_pieces() {
+        // A rook in the open centre reaches far more squares than one boxed into a
+        // corner behind its own king and pawns. Test mobility() directly so the
+        // result is isolated from PST and material.
+        let active =
+            mobility(&Board::from_str("4k3/8/8/8/3R4/8/8/4K3 w - - 0 1").unwrap(), Color::White);
+        let boxed =
+            mobility(&Board::from_str("4k3/8/8/8/8/8/PP6/KR6 w - - 0 1").unwrap(), Color::White);
+        assert!(active.mg > boxed.mg, "active rook {active:?} should out-move boxed {boxed:?}");
+        assert!(active.eg > boxed.eg);
+    }
+
+    fn sq(s: &str) -> Square {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn passed_and_adjacent_masks_are_exact() {
+        // The off-by-one magnet: same + adjacent files, strictly ahead, per colour.
+        // White pawn on e4 → d5–d8, e5–e8, f5–f8 (12 squares); nothing on rank ≤ 4
+        // and nothing off the d/e/f files.
+        let m = PASSED_MASKS[Color::White.index()][sq("e4").0 as usize];
+        assert_eq!(m.count(), 12);
+        for s in ["d5", "e5", "f5", "d8", "e8", "f8"] {
+            assert!(m.contains(sq(s)), "white passed mask for e4 should include {s}");
+        }
+        for s in ["e4", "e3", "e2", "c5", "g5"] {
+            assert!(!m.contains(sq(s)), "white passed mask for e4 should exclude {s}");
+        }
+        // Black travels the other way: e5 → d1–d4, e1–e4, f1–f4.
+        let mb = PASSED_MASKS[Color::Black.index()][sq("e5").0 as usize];
+        assert_eq!(mb.count(), 12);
+        assert!(mb.contains(sq("e4")) && mb.contains(sq("d1")));
+        assert!(!mb.contains(sq("e6")) && !mb.contains(sq("e5")));
+        // Adjacent files of e are d and f only (not e).
+        assert_eq!(
+            ADJACENT_FILE_MASKS[sq("e4").file() as usize],
+            FILE_MASKS[3].union(FILE_MASKS[5])
+        );
+    }
+
+    #[test]
+    fn isolated_pawn_is_a_penalty() {
+        // White d4, blocked and flanked by black c5/d5/e5: not passed (enemy ahead),
+        // not doubled, and isolated (no friendly c/e pawn). So the term is exactly
+        // the isolated penalty — a direct sign + detection check.
+        let b = Board::from_str("4k3/8/8/2ppp3/3P4/8/8/4K3 w - - 0 1").unwrap();
+        let s = pawn_structure(&b, Color::White);
+        assert_eq!(s, ISOLATED_PAWN);
+        assert!(s.mg < 0 && s.eg < 0, "isolated pawn must be a penalty, got {s:?}");
+    }
+
+    #[test]
+    fn doubled_pawns_score_worse_than_a_single_pawn() {
+        // a2+a3 (doubled, both isolated, both passed) vs a3 alone (isolated, passed).
+        // The stack must score lower in both phases — the doubled penalty dominates
+        // the extra back-pawn's passed bonus.
+        let doubled = pawn_structure(
+            &Board::from_str("4k3/8/8/8/8/P7/P7/4K3 w - - 0 1").unwrap(),
+            Color::White,
+        );
+        let single = pawn_structure(
+            &Board::from_str("4k3/8/8/8/8/P7/8/4K3 w - - 0 1").unwrap(),
+            Color::White,
+        );
+        assert!(
+            doubled.mg < single.mg,
+            "doubled {doubled:?} should be worse than single {single:?}"
+        );
+        assert!(doubled.eg < single.eg);
+    }
+
+    #[test]
+    fn passed_pawn_beats_a_blocked_pawn() {
+        // White e5 with a clear path (passed) vs a black pawn on e6 ahead (blocked,
+        // not passed). The passed pawn must score higher, more so in the endgame.
+        let passed = pawn_structure(
+            &Board::from_str("4k3/8/8/4P3/8/8/8/4K3 w - - 0 1").unwrap(),
+            Color::White,
+        );
+        let blocked = pawn_structure(
+            &Board::from_str("4k3/4p3/4P3/8/8/8/8/4K3 w - - 0 1").unwrap(),
+            Color::White,
+        );
+        assert!(passed.eg > blocked.eg, "passed {passed:?} should beat blocked {blocked:?}");
+    }
+
+    #[test]
+    fn exposed_king_is_penalised() {
+        // Safe king tucked on g1 behind f2/g2/h2 with no enemy pressure → no
+        // penalty. Exposed king on e4 in the open with a black queen + rook bearing
+        // down the d/e files and no shield → a clear middlegame penalty.
+        let safe = king_safety(
+            &Board::from_str("4k3/8/8/8/8/8/5PPP/6K1 w - - 0 1").unwrap(),
+            Color::White,
+        );
+        let exposed = king_safety(
+            &Board::from_str("3qr3/8/8/8/4K3/8/8/4k3 w - - 0 1").unwrap(),
+            Color::White,
+        );
+        assert_eq!(
+            safe,
+            Score::default(),
+            "a sheltered king with no pressure should be unpenalised"
+        );
+        assert!(
+            exposed.mg < safe.mg,
+            "exposed king {exposed:?} should be worse than safe {safe:?}"
+        );
+        assert_eq!(exposed.eg, 0, "king safety is middlegame-only");
     }
 }
