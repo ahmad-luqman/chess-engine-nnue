@@ -38,6 +38,74 @@ impl CastlingRights {
     }
 }
 
+/// The set of `(piece, square)` input features a single move toggles — exactly
+/// what an NNUE accumulator update needs to add/subtract a few weight columns
+/// instead of recomputing from scratch (see `docs/04-nnue.md`).
+///
+/// `make_move` already enumerates every feature it touches for the incremental
+/// Zobrist key; this records the same toggles as two short lists. **Nothing reads
+/// it yet** — it is plumbing for the NNUE inference work (#46), which will consume
+/// [`added`](Self::added)/[`removed`](Self::removed) at make time and replay them
+/// in reverse at unmake.
+///
+/// Capacity is a fixed 2 per list, which is the exact maximum across all move
+/// kinds: a quiet move toggles 1+1, a capture or en-passant 2 removed + 1 added,
+/// a promotion (with or without capture) 1–2 removed + 1 added, and castling 2+2
+/// (king and rook). Unused slots hold a sentinel so the struct stays `Copy + Eq`
+/// for [`Undo`]'s derives; the count gates every read, so the sentinel is never
+/// observed.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct DirtyPiece {
+    added: [(Piece, Square); 2],
+    removed: [(Piece, Square); 2],
+    num_added: u8,
+    num_removed: u8,
+}
+
+impl DirtyPiece {
+    /// Placeholder filling unused array slots; `num_*` keeps it out of every read.
+    const SENTINEL: (Piece, Square) =
+        (Piece { color: Color::White, piece_type: PieceType::Pawn }, Square(0));
+
+    /// A delta that toggles nothing — the starting point a move fills in, and the
+    /// final value for a null move (which touches no piece features).
+    fn empty() -> DirtyPiece {
+        DirtyPiece {
+            added: [DirtyPiece::SENTINEL; 2],
+            removed: [DirtyPiece::SENTINEL; 2],
+            num_added: 0,
+            num_removed: 0,
+        }
+    }
+
+    /// Record that `piece` arrived on `sq` (a weight column to add).
+    fn add(&mut self, piece: Piece, sq: Square) {
+        debug_assert!((self.num_added as usize) < self.added.len(), "DirtyPiece added overflow");
+        self.added[self.num_added as usize] = (piece, sq);
+        self.num_added += 1;
+    }
+
+    /// Record that `piece` left `sq` (a weight column to subtract).
+    fn remove(&mut self, piece: Piece, sq: Square) {
+        debug_assert!(
+            (self.num_removed as usize) < self.removed.len(),
+            "DirtyPiece removed overflow"
+        );
+        self.removed[self.num_removed as usize] = (piece, sq);
+        self.num_removed += 1;
+    }
+
+    /// The features this move added — columns the accumulator gains.
+    pub fn added(&self) -> &[(Piece, Square)] {
+        &self.added[..self.num_added as usize]
+    }
+
+    /// The features this move removed — columns the accumulator loses.
+    pub fn removed(&self) -> &[(Piece, Square)] {
+        &self.removed[..self.num_removed as usize]
+    }
+}
+
 /// The information [`Board::make_move`] must squirrel away to let
 /// [`Board::unmake_move`] restore the position exactly.
 ///
@@ -57,6 +125,11 @@ pub struct Undo {
     ep_square: Option<Square>,
     halfmove_clock: u16,
     hash: u64,
+    /// The `(piece, square)` features this move toggled — see [`DirtyPiece`]. Rides
+    /// along on the undo record (Stockfish's `StateInfo` model) so the NNUE
+    /// accumulator update (#46) can read it at make *and* unmake without changing
+    /// any call site. Empty for a null move.
+    pub dirty: DirtyPiece,
 }
 
 /// The rook's `(from, to)` squares for a castling move, derived from the king's
@@ -182,13 +255,16 @@ impl Board {
         let from = mv.from();
         let to = mv.to();
 
-        let prev = Undo {
-            captured: None, // overwritten below if this move captures
-            castling: self.castling,
-            ep_square: self.ep_square,
-            halfmove_clock: self.halfmove_clock,
-            hash: self.hash, // pre-move snapshot; unmake restores it verbatim
-        };
+        // Snapshot the irreversible pre-move state; the `Undo` is assembled from
+        // these once, at the end, to avoid building a throwaway struct mid-flight.
+        let prev_castling = self.castling;
+        let prev_ep_square = self.ep_square;
+        let prev_halfmove_clock = self.halfmove_clock;
+        let prev_hash = self.hash; // pre-move snapshot; unmake restores it verbatim
+
+        // Record the toggled features for the NNUE accumulator, in lockstep with
+        // the Zobrist XORs that follow — same removes, same adds.
+        let mut dirty = DirtyPiece::empty();
 
         // Maintain the Zobrist key incrementally: every board feature this move
         // touches is XORed out of `hash` as it leaves and in as it arrives.
@@ -199,6 +275,7 @@ impl Board {
 
         let moving = self.remove_piece(from).expect("a move originates on an occupied square");
         hash ^= piece_key(moving, from);
+        dirty.remove(moving, from);
         let is_pawn = moving.piece_type == PieceType::Pawn;
 
         // Remove the captured piece, if any. En-passant's victim is beside the
@@ -208,6 +285,7 @@ impl Board {
         let captured = self.remove_piece(captured_square);
         if let Some(victim) = captured {
             hash ^= piece_key(victim, captured_square);
+            dirty.remove(victim, captured_square);
         }
 
         // Place the moving piece, swapping in the promoted piece if promoting.
@@ -217,14 +295,17 @@ impl Board {
         };
         self.put_piece(to, placed);
         hash ^= piece_key(placed, to);
+        dirty.add(placed, to);
 
         // Relocate the rook on a castle (the king's own move is already done).
         if mv.is_castle() {
             let (rook_from, rook_to) = castle_rook_squares(mv);
             let rook = self.remove_piece(rook_from).expect("a castling rook is present");
             hash ^= piece_key(rook, rook_from);
+            dirty.remove(rook, rook_from);
             self.put_piece(rook_to, rook);
             hash ^= piece_key(rook, rook_to);
+            dirty.add(rook, rook_to);
         }
 
         // A double pawn push (and nothing else) sets the en-passant square — the
@@ -265,7 +346,14 @@ impl Board {
         // recomputation; a mismatch means a feature toggle was missed above.
         debug_assert_eq!(self.hash, zobrist::compute(self), "incremental hash drifted");
 
-        Undo { captured, ..prev }
+        Undo {
+            captured,
+            castling: prev_castling,
+            ep_square: prev_ep_square,
+            halfmove_clock: prev_halfmove_clock,
+            hash: prev_hash,
+            dirty,
+        }
     }
 
     /// Reverse a [`make_move`](Self::make_move), restoring the position exactly.
@@ -333,6 +421,7 @@ impl Board {
             ep_square: self.ep_square,
             halfmove_clock: self.halfmove_clock,
             hash: self.hash, // pre-move snapshot; unmake restores it verbatim
+            dirty: DirtyPiece::empty(), // a null move toggles no piece features
         };
 
         let mut hash = self.hash;
@@ -470,6 +559,160 @@ mod tests {
                 assert_eq!(b, original, "{mv} in {fen} did not round-trip");
             }
         }
+    }
+
+    // ── DirtyPiece feature deltas (issue #43) ───────────────────────────────
+
+    /// The `(piece, square)` features of `slice`, squares as raw indices, sorted
+    /// by square so a set comparison is order-independent (squares are unique
+    /// within an add/remove list, giving a total order).
+    fn feats(slice: &[(Piece, Square)]) -> Vec<(Piece, u8)> {
+        let mut v: Vec<(Piece, u8)> = slice.iter().map(|&(p, s)| (p, s.0)).collect();
+        v.sort_by_key(|&(_, s)| s);
+        v
+    }
+
+    /// Same, for a `(piece, "e4")` expectation spec written with algebraic squares.
+    fn spec(items: &[(Piece, &str)]) -> Vec<(Piece, u8)> {
+        let mut v: Vec<(Piece, u8)> =
+            items.iter().map(|&(p, s)| (p, Square::from_str(s).unwrap().0)).collect();
+        v.sort_by_key(|&(_, s)| s);
+        v
+    }
+
+    /// Make the unique legal move matching `from`/`to`/`promo`, returning its undo.
+    fn make_uci(board: &mut Board, from: &str, to: &str, promo: Option<PieceType>) -> Undo {
+        let from = Square::from_str(from).unwrap();
+        let to = Square::from_str(to).unwrap();
+        let mv = generate_legal(board)
+            .into_iter()
+            .find(|m| m.from() == from && m.to() == to && m.promotion_piece() == promo)
+            .expect("a legal move matching from/to/promo");
+        board.make_move(mv)
+    }
+
+    fn assert_dirty(undo: &Undo, added: &[(Piece, &str)], removed: &[(Piece, &str)]) {
+        assert_eq!(feats(undo.dirty.added()), spec(added), "added features");
+        assert_eq!(feats(undo.dirty.removed()), spec(removed), "removed features");
+    }
+
+    #[test]
+    fn dirty_piece_reconstructs_board_change_across_perft() {
+        // The acceptance gate: at every node of a perft walk, replaying the move's
+        // DirtyPiece onto the pre-move board (removes first so put_piece's
+        // empty-assert holds on a capture `to` square, then adds) must reproduce
+        // the post-move *piece placement* exactly. We compare only the piece views
+        // — stm/castling/ep/clock/hash legitimately differ and DirtyPiece does not
+        // track them.
+        fn walk(board: &mut Board, depth: u32) {
+            for mv in generate_legal(board) {
+                let before = board.clone();
+                let undo = board.make_move(mv);
+
+                let mut recon = before.clone();
+                for &(piece, sq) in undo.dirty.removed() {
+                    // Bonus check: the feature names the piece actually on the square.
+                    assert_eq!(
+                        recon.remove_piece(sq),
+                        Some(piece),
+                        "{mv}: removed mismatch at {sq}"
+                    );
+                }
+                for &(piece, sq) in undo.dirty.added() {
+                    recon.put_piece(sq, piece);
+                }
+                assert_eq!(recon.piece_bb, board.piece_bb, "{mv}: piece_bb diverged");
+                assert_eq!(recon.color_bb, board.color_bb, "{mv}: color_bb diverged");
+                assert_eq!(recon.mailbox, board.mailbox, "{mv}: mailbox diverged");
+
+                if depth > 1 {
+                    walk(board, depth - 1);
+                }
+                board.unmake_move(mv, undo);
+            }
+        }
+        for fen in [STARTPOS, KIWIPETE, POS3, POS4, POS5, EP_POS] {
+            walk(&mut board(fen), 3);
+        }
+    }
+
+    #[test]
+    fn dirty_piece_quiet_move() {
+        let wp = piece(Color::White, PieceType::Pawn);
+        let undo = make_uci(&mut board(STARTPOS), "e2", "e4", None);
+        assert_dirty(&undo, &[(wp, "e4")], &[(wp, "e2")]);
+    }
+
+    #[test]
+    fn dirty_piece_capture() {
+        let wp = piece(Color::White, PieceType::Pawn);
+        let bp = piece(Color::Black, PieceType::Pawn);
+        let undo = make_uci(&mut board("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1"), "e4", "d5", None);
+        assert_dirty(&undo, &[(wp, "d5")], &[(wp, "e4"), (bp, "d5")]);
+    }
+
+    #[test]
+    fn dirty_piece_en_passant() {
+        // White e5 pawn takes d6 e.p.; the victim sits on d5, not on the `to` square.
+        let wp = piece(Color::White, PieceType::Pawn);
+        let bp = piece(Color::Black, PieceType::Pawn);
+        let undo = make_uci(&mut board(EP_POS), "e5", "d6", None);
+        assert_dirty(&undo, &[(wp, "d6")], &[(wp, "e5"), (bp, "d5")]);
+    }
+
+    #[test]
+    fn dirty_piece_castles() {
+        let wk = piece(Color::White, PieceType::King);
+        let wr = piece(Color::White, PieceType::Rook);
+        let bk = piece(Color::Black, PieceType::King);
+        let br = piece(Color::Black, PieceType::Rook);
+        const WHITE: &str = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1";
+        const BLACK: &str = "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1";
+
+        let undo = make_uci(&mut board(WHITE), "e1", "g1", None); // O-O
+        assert_dirty(&undo, &[(wk, "g1"), (wr, "f1")], &[(wk, "e1"), (wr, "h1")]);
+
+        let undo = make_uci(&mut board(WHITE), "e1", "c1", None); // O-O-O
+        assert_dirty(&undo, &[(wk, "c1"), (wr, "d1")], &[(wk, "e1"), (wr, "a1")]);
+
+        let undo = make_uci(&mut board(BLACK), "e8", "g8", None); // ...O-O
+        assert_dirty(&undo, &[(bk, "g8"), (br, "f8")], &[(bk, "e8"), (br, "h8")]);
+
+        let undo = make_uci(&mut board(BLACK), "e8", "c8", None); // ...O-O-O
+        assert_dirty(&undo, &[(bk, "c8"), (br, "d8")], &[(bk, "e8"), (br, "a8")]);
+    }
+
+    #[test]
+    fn dirty_piece_promotion() {
+        // a7-a8 promoting to each piece: the pawn leaves a7, the promoted piece
+        // (not a pawn) arrives on a8.
+        let wp = piece(Color::White, PieceType::Pawn);
+        for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+            let promoted = piece(Color::White, pt);
+            let undo = make_uci(&mut board("4k3/P7/8/8/8/8/8/4K3 w - - 0 1"), "a7", "a8", Some(pt));
+            assert_dirty(&undo, &[(promoted, "a8")], &[(wp, "a7")]);
+        }
+    }
+
+    #[test]
+    fn dirty_piece_promotion_with_capture() {
+        // a7xb8 capturing a knight and promoting: pawn leaves a7, victim leaves b8,
+        // the promoted piece arrives on b8.
+        let wp = piece(Color::White, PieceType::Pawn);
+        let bn = piece(Color::Black, PieceType::Knight);
+        for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+            let promoted = piece(Color::White, pt);
+            let undo =
+                make_uci(&mut board("1n2k3/P7/8/8/8/8/8/4K3 w - - 0 1"), "a7", "b8", Some(pt));
+            assert_dirty(&undo, &[(promoted, "b8")], &[(wp, "a7"), (bn, "b8")]);
+        }
+    }
+
+    #[test]
+    fn dirty_piece_null_move_is_empty() {
+        let undo = board(STARTPOS).make_null_move();
+        assert!(undo.dirty.added().is_empty());
+        assert!(undo.dirty.removed().is_empty());
     }
 
     // ── Zobrist hashing (issue #23) ─────────────────────────────────────────
