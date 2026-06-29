@@ -645,3 +645,75 @@ pre-SEE build (1400 games). Check extensions, SPRT'd separately on top:
 the rest of Phase 3 — the
 futility/razoring pass (#38) will gate its pruning on SEE capture safety. The
 **SPRT vs the current release is the acceptance gate** for each (iron rule #3).
+
+## 10. Near-leaf forward pruning — reverse futility & futility (`src/search.rs`, issue #38)
+
+NMP prunes by passing; LMR reduces. These two prune by **arithmetic** — they read
+the static eval and a depth-scaled margin and decide a node, or a quiet move, can't
+matter. No search, just a comparison. The catch is that an over-eager margin prunes
+a real resource silently, so both are fenced off from PV nodes, in-check nodes, and
+mate-bound windows, and both ride on a single per-node `static_eval` (computed once,
+when not in check — it's meaningless and unused in check) and `is_pv = beta - alpha
+> 1`.
+
+### Reverse futility (static null move)
+
+The fail-high side. Before the move loop:
+
+```text
+if not PV, not in check, depth <= 6, beta < MATE_BOUND
+   and static_eval − 85·depth >= beta:
+       return static_eval
+```
+
+If the eval clears beta even after we hand back 85 cp per ply, the node is almost
+certainly a fail-high — so return without searching. Unlike NMP this passes no move
+and runs *no* verification search; it just trusts the eval. That's why it's capped
+at shallow depth with a generous margin (and why it needs no zugzwang guard — it
+never pretends to pass). **+76.92 ± 20.49 Elo** over the post-#39 build (886 games).
+
+### Futility
+
+The fail-low side, per move. Inside the loop, just after `make_move`:
+
+```text
+for the i-th move (i >= 1), if not PV, not in check, alpha < MATE_BOUND,
+   the move is quiet, doesn't give check,
+   and static_eval + 150·depth <= alpha:
+       skip it (continue)
+```
+
+If even a margin of optimism can't lift a quiet move's result to alpha, don't search
+it. Two gates make this safe rather than reckless:
+
+- **`i >= 1` — never the first move.** Move 0 is always searched, so a node can
+  never be pruned down to *nothing* and fail low spuriously. Futility only ever
+  removes *later* quiet moves.
+- **`gives_check` is tested last.** Like LMR, the "does this move give check?" probe
+  scans the post-make board, so it sits at the end of the `&&` chain — a quiet move
+  that checks can be the tactic, and is never pruned.
+
+Restricted to depth ≤ 2 with a 150 cp/ply margin. **+110.53 ± 23.50 Elo** over the
+RFP build (614 games) — the single largest jump of the selective-search phase; the
+engine had been pouring effort into hopeless quiet moves right above the leaves.
+
+### Razoring — tried and rejected
+
+The third forward prune in #38 was **razoring**: at low depth, when the eval sits a
+margin *below* alpha, verify with a qsearch and drop to it if the node is really
+fail-low. It was implemented, with the verification — and it **dropped a forced
+mate-in-2** in the test suite. The mating line is a queen sacrifice: after the sac
+the static eval reads "lost", razoring hands the node to a qsearch that only resolves
+captures (never the quiet mating move), and the line is pruned as fail-low. A
+verifying qsearch is still blind to a sacrificial mate. That's a hard correctness
+failure, not a soft SPRT call, so razoring does not ship (see ADR 0014). RFP and
+futility already bank the bulk of #38's value.
+
+### Why no invariance test
+
+As with NMP and LMR, both prunes deliberately change the tree. Correctness is
+behavioural: `rfp_cutoffs` / `fut_prunes` active-rate tests assert they fire in
+bulk, and the forced-mate / decisively-winning tactical tests assert no dropped win
+— the very tests that caught razoring. The margins (`RFP_MARGIN`, `FUT_MARGIN`, and
+the depth caps) are conservative first-SPRT values and are prime targets for the
+next tuning pass.
