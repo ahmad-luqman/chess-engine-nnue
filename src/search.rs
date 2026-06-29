@@ -49,13 +49,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::{Evaluator, Material, PIECE_VALUE};
-use crate::movegen::{generate_legal, in_check};
+use crate::movegen::{
+    bishop_attacks, generate_legal, in_check, king_attacks, knight_attacks, pawn_attacks,
+    rook_attacks,
+};
 use crate::moves::Move;
 use crate::timeman::Budget;
 use crate::tt::{Bound, TranspositionTable};
-use crate::types::{Color, PieceType};
+use crate::types::{Color, PieceType, Square};
 
 /// A score larger than any real evaluation — used as the initial alpha/beta
 /// bounds (an open window). Must exceed every score the tree can produce,
@@ -219,6 +223,133 @@ fn order_moves(
 /// killer/history heuristics, which track *quiet* cutoffs only.
 fn is_tactical(mv: Move) -> bool {
     mv.is_capture() || mv.promotion_piece().is_some()
+}
+
+// ── Static Exchange Evaluation (issue #39) ──────────────────────────────────
+//
+// MVV-LVA orders captures by victim/attacker value but can't see past the first
+// exchange: it rates RxP highly even when the pawn is defended and the rook is
+// lost. SEE resolves the *whole* capture sequence on the target square
+// statically — both sides keep recapturing with their least valuable attacker —
+// and returns the net material the initiating side ends up with. Order and
+// quiescence then demote / skip captures that SEE says lose material.
+
+/// Every piece (either color) that attacks `sq` given the `occupied` mask.
+///
+/// Sliders are computed against `occupied`, so as the swap-off removes pieces
+/// the mask shrinks and X-ray attackers behind them (a rook behind a rook, a
+/// queen behind a bishop) are revealed on the next call. Pawn attackers use the
+/// reflection identity: the pawns of color `c` hitting `sq` sit where a pawn of
+/// the *opposite* color on `sq` would capture.
+#[allow(dead_code)] // wired into ordering + qsearch in the next commit
+fn attackers_to(board: &Board, sq: Square, occupied: Bitboard) -> Bitboard {
+    let pawns = board.pieces(PieceType::Pawn);
+    let white_pawns =
+        pawn_attacks(Color::Black, sq).intersect(pawns).intersect(board.color(Color::White));
+    let black_pawns =
+        pawn_attacks(Color::White, sq).intersect(pawns).intersect(board.color(Color::Black));
+
+    let knights = knight_attacks(sq).intersect(board.pieces(PieceType::Knight));
+    let kings = king_attacks(sq).intersect(board.pieces(PieceType::King));
+
+    let bishops_queens = board.pieces(PieceType::Bishop).union(board.pieces(PieceType::Queen));
+    let diag = bishop_attacks(sq, occupied).intersect(bishops_queens);
+    let rooks_queens = board.pieces(PieceType::Rook).union(board.pieces(PieceType::Queen));
+    let orth = rook_attacks(sq, occupied).intersect(rooks_queens);
+
+    white_pawns.union(black_pawns).union(knights).union(kings).union(diag).union(orth)
+}
+
+/// The cheapest attacker in `attackers` (a set of one color's pieces), as
+/// `(square, type)`. "Cheapest" is by `PieceType` *index* (Pawn=0 … King=5), not
+/// `PIECE_VALUE`, because the king's value there is 0 — index ordering keeps the
+/// king correctly ranked as the recapturer of last resort.
+#[allow(dead_code)] // wired into ordering + qsearch in the next commit
+fn least_valuable_attacker(board: &Board, attackers: Bitboard) -> Option<(Square, PieceType)> {
+    let mut best: Option<(Square, PieceType)> = None;
+    let mut bb = attackers;
+    while let Some(sq) = bb.pop_lsb() {
+        let pt = board.piece_on(sq).expect("attacker square is occupied").piece_type;
+        if best.is_none_or(|(_, b)| pt.index() < b.index()) {
+            best = Some((sq, pt));
+        }
+    }
+    best
+}
+
+/// Static Exchange Evaluation of capture `mv`: the material the moving side nets
+/// after the optimal sequence of recaptures on `mv.to()`. Positive wins material,
+/// negative loses it. Pure function of the position — no search, no make/unmake.
+///
+/// v1 scope: promotions inside the sequence are ignored (a promoting pawn counts
+/// as a pawn). Both call sites use only the sign, so this approximation is safe.
+#[allow(dead_code)] // wired into ordering + qsearch in the next commit
+fn see(board: &Board, mv: Move) -> i32 {
+    let to = mv.to();
+    let from = mv.from();
+    let Some(mover) = board.piece_on(from) else {
+        return 0;
+    };
+
+    // The piece currently on `to` is what the first recapturer stands to win.
+    // En passant is special: the victim is a pawn one rank behind `to`, not on it.
+    let mut occupied = board.occupied().without(from);
+    let mut gain = [0i32; 32];
+    gain[0] = if mv.is_en_passant() {
+        let victim_sq =
+            if mover.color == Color::White { Square(to.0 - 8) } else { Square(to.0 + 8) };
+        occupied = occupied.without(victim_sq);
+        PIECE_VALUE[PieceType::Pawn.index()]
+    } else {
+        match board.piece_on(to) {
+            Some(p) => PIECE_VALUE[p.piece_type.index()],
+            None => return 0, // not a capture — caller shouldn't ask, but be safe
+        }
+    };
+
+    // Value of the piece now sitting on `to` (the attacker that just moved there);
+    // this is what the *next* recapturer would win.
+    let mut on_square = PIECE_VALUE[mover.piece_type.index()];
+    let mut side = mover.color.flip();
+    let mut d = 0usize;
+
+    loop {
+        // Attackers still on the board, of the side to recapture. Intersecting
+        // with `occupied` drops pieces the swap-off has already consumed.
+        let attackers =
+            attackers_to(board, to, occupied).intersect(occupied).intersect(board.color(side));
+        let Some((lva_sq, lva_type)) = least_valuable_attacker(board, attackers) else {
+            break;
+        };
+
+        // A king may only recapture if the square is then undefended — capturing
+        // into an enemy attacker would be moving into check (illegal).
+        if lva_type == PieceType::King {
+            let after = occupied.without(lva_sq);
+            let defenders =
+                attackers_to(board, to, after).intersect(after).intersect(board.color(side.flip()));
+            if !defenders.is_empty() {
+                break;
+            }
+        }
+
+        d += 1;
+        if d >= gain.len() {
+            break; // overflow guard; 32 plies of recaptures is unreachable
+        }
+        gain[d] = on_square - gain[d - 1];
+        on_square = PIECE_VALUE[lva_type.index()];
+        occupied = occupied.without(lva_sq);
+        side = side.flip();
+    }
+
+    // Fold back with the stand-pat rule: at each ply the side to move recaptures
+    // only if doing so beats declining (negamax over the gain list).
+    while d > 0 {
+        gain[d - 1] = -(-gain[d - 1]).max(gain[d]);
+        d -= 1;
+    }
+    gain[0]
 }
 
 /// Whether `side` has any non-pawn, non-king material (a knight, bishop, rook, or
@@ -1273,5 +1404,78 @@ mod tests {
             "NMP fired in a pawn-only endgame ({} attempts) — zugzwang guard failed",
             ctx.null_attempts
         );
+    }
+
+    // ── Static Exchange Evaluation (issue #39) ──────────────────────────────
+    //
+    // SEE bugs don't crash — they quietly mis-order/mis-prune captures and show
+    // up only as a flat SPRT. So these hand-verified exchange sequences are the
+    // real correctness gate. PIECE_VALUE = [P=100, N=320, B=330, R=500, Q=900].
+
+    /// Find the legal move whose UCI string matches `uci`, so the generator sets
+    /// the capture / en-passant / promotion flags `see` reads.
+    fn find_move(b: &Board, uci: &str) -> Move {
+        generate_legal(b)
+            .into_iter()
+            .find(|m| m.to_string() == uci)
+            .unwrap_or_else(|| panic!("no legal move {uci} in position"))
+    }
+
+    #[test]
+    fn see_wins_a_hanging_queen() {
+        // Rd1xd4 takes an undefended queen: net +900, nothing recaptures.
+        let b = board("4k3/8/8/8/3q4/8/8/3RK3 w - - 0 1");
+        assert_eq!(see(&b, find_move(&b, "d1d4")), PIECE_VALUE[PieceType::Queen.index()]);
+    }
+
+    #[test]
+    fn see_loses_rook_for_defended_pawn() {
+        // Rd1xd5 grabs a pawn that the c6 pawn defends: win 100, lose the 500
+        // rook to the recapture ⇒ −400. MVV-LVA would rate this capture highly.
+        let b = board("4k3/8/2p5/3p4/8/8/8/3RK3 w - - 0 1");
+        assert_eq!(see(&b, find_move(&b, "d1d5")), -400);
+    }
+
+    #[test]
+    fn see_equal_pawn_trade_is_zero() {
+        // e4xd5, the d5 pawn defended by c6: pawn for pawn ⇒ 0.
+        let b = board("4k3/8/2p5/3p4/4P3/8/8/4K3 w - - 0 1");
+        assert_eq!(see(&b, find_move(&b, "e4d5")), 0);
+    }
+
+    #[test]
+    fn see_reveals_xray_battery() {
+        // Doubled white rooks (e1 behind e2) vs a black rook on e8, target pawn
+        // e5. Re2xe5, Rxe5, then the e1 rook — revealed once e2 leaves — retakes:
+        // 100 − 500 + 500 − 500 + 500 nets +100. This only comes out right if the
+        // slider attackers are recomputed against the shrinking occupancy.
+        let b = board("4r1k1/8/8/4p3/8/8/4R3/4R1K1 w - - 0 1");
+        assert_eq!(see(&b, find_move(&b, "e2e5")), 100);
+    }
+
+    #[test]
+    fn see_king_cannot_recapture_into_defence() {
+        // Ra2xa7: the black king is a7's only defender, but the a1 rook (revealed
+        // when a2 leaves) still guards a7, so Kxa7 would be moving into check and
+        // is illegal. The exchange stops after the capture ⇒ white keeps the pawn,
+        // +100.
+        let b = board("1k6/p7/8/8/8/8/R7/R6K w - - 0 1");
+        assert_eq!(see(&b, find_move(&b, "a2a7")), 100);
+    }
+
+    #[test]
+    fn see_en_passant_victim_off_target_square() {
+        // e5xd6 e.p. — the captured pawn sits on d5, not the d6 landing square.
+        // Undefended ⇒ +100. Exercises the en-passant occupancy bookkeeping.
+        let b = board("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1");
+        assert_eq!(see(&b, find_move(&b, "e5d6")), PIECE_VALUE[PieceType::Pawn.index()]);
+    }
+
+    #[test]
+    fn see_en_passant_with_recapture_is_even() {
+        // Same e.p. capture but a black pawn on e7 recaptures on d6: pawn for
+        // pawn ⇒ 0.
+        let b = board("4k3/4p3/8/3pP3/8/8/8/4K3 w - d6 0 1");
+        assert_eq!(see(&b, find_move(&b, "e5d6")), 0);
     }
 }
