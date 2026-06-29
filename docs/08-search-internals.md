@@ -717,3 +717,68 @@ bulk, and the forced-mate / decisively-winning tactical tests assert no dropped 
 — the very tests that caught razoring. The margins (`RFP_MARGIN`, `FUT_MARGIN`, and
 the depth caps) are conservative first-SPRT values and are prime targets for the
 next tuning pass.
+
+## 11. Aspiration windows — searching narrow around a prior (`src/search.rs`, issue #35)
+
+Iterative deepening searches the root again at every depth. The score barely moves
+between depths — depth `d+1` is usually within a pawn of depth `d` — so opening the
+full `(-INF, INF)` window each time wastes the prior. An **aspiration window** seeds
+the root search narrow around the previous score and only widens when the true score
+actually escapes it.
+
+### The win, and the cost
+
+A narrow root window propagates *down* the tree: a tight `beta` is exactly what RFP,
+NMP, and futility (§8, §10) test against, so they prune far more. The price is the
+**re-search** — when the score lands outside the window the root "fails" low or high
+and has to be redone wider. Aspiration is a bet that the prior is usually close, so
+the prunes are paid for many times over and the occasional re-search is cheap.
+
+### Seed and widen
+
+```text
+if depth < 3 or |prev| is a mate:      # no usable prior / can't bracket a mate
+    search the full (-INF, INF) window
+else:
+    delta = 25
+    alpha, beta = prev - delta, prev + delta
+    loop:
+        score = search_root(alpha, beta)
+        if score <= alpha:  alpha -= delta; delta *= 2   # fail-low, widen down
+        elif score >= beta: beta  += delta; delta *= 2   # fail-high, widen up
+        else: return score                               # inside: exact
+```
+
+Only the failing side widens, and only as far as needed — a score just past the
+window gets a slightly wider bracket, not a jump to full width. Doubling `delta`
+guarantees termination: each fail pushes a bound toward `±INF`, and a bound at
+infinity can't fail that way again, so the loop converges to a full window in the
+worst case.
+
+### The refactor that makes it honest
+
+The root search split in two so the fixed-depth path stays exact:
+
+- `search_root(alpha, beta)` is the windowed core, now **fail-soft**: it returns a
+  score that can sit at/below `alpha` or at/above `beta`, takes a real root beta
+  cutoff, and stores the matching TT bound (`Exact`/`Upper`/`Lower`).
+- `run_root` is just `search_root(-INF, INF)` — always exact. The fixed-depth
+  `search` entry and every test use it, so their results don't move. Aspiration runs
+  *only* in the timed iterative-deepening loop.
+
+### Why no invariance worry
+
+`run_root` is unchanged in effect (full window, exact), so the PVS move-invariance
+golden and the fixed-depth tests are untouched. Aspiration's correctness is asserted
+on its own terms: seeded with the true score it returns the *same* score and move as
+a full-window search (the window is a speed trick, not a different search), and
+seeded with a deliberately wrong prior it widens and recovers the true score, with
+`asp_researches` confirming the re-searches happened. `ASPIRATION_DELTA` and the
+doubling schedule are the obvious tuning knobs for a later pass.
+
+### What it buys
+
+**+53.45 ± 16.34 Elo**, LLR 2.95 (1140 games) over the post-#38 build. With this in,
+Phase 3's selective-search track is complete — PVS, LMR, NMP, SEE + check extensions, forward pruning, and
+aspiration — and **the SPRT vs the current release is the acceptance gate**
+(iron rule #3).
