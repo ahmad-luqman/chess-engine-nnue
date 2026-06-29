@@ -102,6 +102,13 @@ const MATE_BOUND: i32 = MATE - 1000;
 const RFP_MAX_DEPTH: u32 = 6;
 const RFP_MARGIN: i32 = 85;
 
+/// Aspiration windows (issue #35): the half-width of the initial root window
+/// centred on the previous iteration's score. If the true score lands inside, the
+/// search prunes far more than a full `(-INF, INF)` window would; if it falls
+/// outside, the window widens (doubling this delta) on the failing side and the
+/// root is re-searched.
+const ASPIRATION_DELTA: i32 = 25;
+
 /// Futility pruning (issue #38): at the shallowest depths, a late quiet move whose
 /// static eval plus this per-ply margin still can't reach `alpha` is skipped
 /// unsearched — it almost certainly can't raise alpha. The margin is the most a
@@ -501,6 +508,10 @@ struct SearchContext<'a> {
     /// unsearched because the static eval plus margin couldn't reach alpha. Counts
     /// only; never affects the result.
     fut_prunes: u64,
+    /// Aspiration diagnostics (issue #35): how many times a root search fell
+    /// outside its window and had to be re-searched wider. A low count relative to
+    /// total iterations means the windows usually hold. Counts only.
+    asp_researches: u64,
 }
 
 impl<'a> SearchContext<'a> {
@@ -527,6 +538,7 @@ impl<'a> SearchContext<'a> {
             check_extensions: 0,
             rfp_cutoffs: 0,
             fut_prunes: 0,
+            asp_researches: 0,
         }
     }
 
@@ -635,11 +647,14 @@ pub fn search_timed(
         check_extensions: 0,
         rfp_cutoffs: 0,
         fut_prunes: 0,
+        asp_researches: 0,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
     for depth in 1..=budget.max_depth {
-        let result = run_root(&mut board, &mut ctx, depth);
+        // Aspiration windows (issue #35): seed the root window from the previous
+        // iteration's score so most of the tree is searched far more narrowly.
+        let result = aspiration_search(&mut board, &mut ctx, depth, best.score);
         if ctx.aborted {
             break; // partial iteration — discard it, keep the last good `best`.
         }
@@ -671,11 +686,69 @@ pub fn search_timed(
     best
 }
 
-/// One fixed-depth search from the root. Like an interior negamax node but it
-/// remembers which move achieved alpha and takes no beta cutoff (there is no
-/// parent to cut to — we want the genuinely best move). Bails out cleanly if the
-/// context aborts mid-iteration.
+/// One fixed-depth search from the root over the full `(-INF, INF)` window —
+/// always returns an exact score. The fixed-depth [`search`] entry and the tests
+/// use this; the timed iterative-deepening loop goes through [`aspiration_search`].
 fn run_root(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32) -> SearchResult {
+    search_root(board, ctx, depth, -INF, INF)
+}
+
+/// Iterative-deepening root search with an **aspiration window** (issue #35).
+///
+/// The previous iteration's score is a strong prior, so instead of searching the
+/// full `(-INF, INF)` window we open a narrow one around it. A true score inside
+/// the window is found far more cheaply (the tight bounds let RFP/NMP/futility
+/// prune much more aggressively); a true score outside fails low or high, and we
+/// widen the failing side (doubling the delta) and re-search the root only.
+///
+/// Depths 1–2 have no reliable prior, and a mate score can't be bracketed by a
+/// centipawn window, so both fall back to a full-window search.
+fn aspiration_search(
+    board: &mut Board,
+    ctx: &mut SearchContext<'_>,
+    depth: u32,
+    prev_score: i32,
+) -> SearchResult {
+    if depth < 3 || prev_score.abs() >= MATE_BOUND {
+        return search_root(board, ctx, depth, -INF, INF);
+    }
+
+    let mut delta = ASPIRATION_DELTA;
+    let mut alpha = (prev_score - delta).max(-INF);
+    let mut beta = (prev_score + delta).min(INF);
+    loop {
+        let result = search_root(board, ctx, depth, alpha, beta);
+        if ctx.aborted {
+            return result; // discarded by the caller; don't loop on a partial score
+        }
+        if result.score <= alpha {
+            // Fail-low: the score is at or below the window — drop alpha and retry.
+            ctx.asp_researches += 1;
+            alpha = (alpha - delta).max(-INF);
+            delta = delta.saturating_mul(2);
+        } else if result.score >= beta {
+            // Fail-high: a move beat the window — raise beta and retry.
+            ctx.asp_researches += 1;
+            beta = (beta + delta).min(INF);
+            delta = delta.saturating_mul(2);
+        } else {
+            return result; // inside the window: an exact score.
+        }
+    }
+}
+
+/// One fixed-depth search from the root within `[alpha, beta]`. Like an interior
+/// negamax node, but it remembers which move was best and returns a fail-soft
+/// [`SearchResult`] so the aspiration loop can tell a fail-low (`score <= alpha`)
+/// from a fail-high (`score >= beta`). Bails out cleanly if the context aborts.
+fn search_root(
+    board: &mut Board,
+    ctx: &mut SearchContext<'_>,
+    depth: u32,
+    mut alpha: i32,
+    beta: i32,
+) -> SearchResult {
+    let alpha_orig = alpha;
     let mut moves = generate_legal(board);
     if moves.is_empty() {
         let score = terminal_score(board, 0);
@@ -689,23 +762,23 @@ fn run_root(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32) -> Searc
     order_moves(&mut moves, board, tt_move, &ctx.killers[0], &ctx.history, side);
 
     let mut best_move = Move::NONE;
-    let mut alpha = -INF;
+    let mut best_score = -INF;
     for mv in moves {
         ctx.rep.push(board.hash); // this (root) position becomes an ancestor below
         let undo = board.make_move(mv);
         let score = if best_move == Move::NONE {
-            // First (best-ordered) move: a full-window search establishes the PV
-            // baseline. (-INF, -alpha) is the original root window.
-            -negamax(board, ctx, depth - 1, -INF, -alpha, 1, true)
+            // First (best-ordered) move: a full search of the current window
+            // establishes the PV baseline.
+            -negamax(board, ctx, depth - 1, -beta, -alpha, 1, true)
         } else {
-            // PVS scout: prove later moves worse than the PV with a null window.
-            // The root takes no beta cutoff (its beta is +INF), so any fail-high
-            // is a genuine new best — re-search it full-width for an exact score.
+            // PVS scout: prove later moves worse than the PV with a null window. A
+            // scout that beats alpha but stays under beta may be a new PV — re-
+            // search it full-width (within the window) for an exact score.
             ctx.pvs_scouts += 1;
             let s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, 1, true);
-            if !ctx.aborted && s > alpha {
+            if !ctx.aborted && s > alpha && s < beta {
                 ctx.pvs_researches += 1;
-                -negamax(board, ctx, depth - 1, -INF, -alpha, 1, true)
+                -negamax(board, ctx, depth - 1, -beta, -alpha, 1, true)
             } else {
                 s
             }
@@ -716,20 +789,33 @@ fn run_root(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32) -> Searc
         if ctx.aborted {
             break; // the score is from an interrupted subtree — don't trust it.
         }
-        if best_move == Move::NONE || score > alpha {
-            alpha = score;
+        if score > best_score {
+            best_score = score;
             best_move = mv;
+        }
+        if score > alpha {
+            alpha = score;
+        }
+        if alpha >= beta {
+            break; // fail-high: a root beta cutoff (the aspiration loop widens beta).
         }
     }
 
-    // Cache the root result (a full-window search, so exact) for the next
-    // iteration and future moves. Never store a partial result from an aborted
-    // iteration — its score is untrustworthy.
+    // Cache the root result for the next iteration and future moves, with the bound
+    // its window-relative score implies (exact inside the window, else an upper/
+    // lower bound). Never store a partial result from an aborted iteration.
     if !ctx.aborted && best_move != Move::NONE {
-        ctx.tt.store(board.hash, best_move, score_to_tt(alpha, 0), depth as u8, Bound::Exact);
+        let bound = if best_score <= alpha_orig {
+            Bound::Upper
+        } else if best_score >= beta {
+            Bound::Lower
+        } else {
+            Bound::Exact
+        };
+        ctx.tt.store(board.hash, best_move, score_to_tt(best_score, 0), depth as u8, bound);
     }
 
-    SearchResult { best_move, score: alpha, depth, nodes: ctx.nodes }
+    SearchResult { best_move, score: best_score, depth, nodes: ctx.nodes }
 }
 
 /// Negamax with fail-hard alpha-beta. Returns the position's score from the
@@ -1687,5 +1773,51 @@ mod tests {
             run_root(&mut bb, &mut ctx, d);
         }
         assert!(ctx.fut_prunes > 0, "expected futility prunes, got {}", ctx.fut_prunes);
+    }
+
+    /// Aspiration must converge to the *same* answer a full-window search gives —
+    /// the narrow window is a speed optimisation, not a different search. Seeded
+    /// with the true score, the first window holds and the result is identical.
+    #[test]
+    fn aspiration_matches_full_window() {
+        for fen in [
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", // Kiwipete
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ] {
+            let b = board(fen);
+            let mut tt_a = TranspositionTable::new(16);
+            tt_a.new_search();
+            let full = {
+                let mut ctx = SearchContext::unbounded(&mut tt_a);
+                run_root(&mut b.clone(), &mut ctx, 6)
+            };
+            let mut tt_b = TranspositionTable::new(16);
+            tt_b.new_search();
+            let mut ctx = SearchContext::unbounded(&mut tt_b);
+            let asp = aspiration_search(&mut b.clone(), &mut ctx, 6, full.score);
+            assert_eq!(asp.score, full.score, "aspiration score differs for {fen}");
+            assert_eq!(asp.best_move, full.best_move, "aspiration move differs for {fen}");
+        }
+    }
+
+    /// A wildly wrong prior must not corrupt the result: the window fails low,
+    /// widens, and converges to the true score — and the re-search counter fires.
+    #[test]
+    fn aspiration_recovers_from_a_bad_prior() {
+        let b = board("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10");
+        let mut tt_a = TranspositionTable::new(16);
+        tt_a.new_search();
+        let full = {
+            let mut ctx = SearchContext::unbounded(&mut tt_a);
+            run_root(&mut b.clone(), &mut ctx, 6)
+        };
+        let mut tt_b = TranspositionTable::new(16);
+        tt_b.new_search();
+        let mut ctx = SearchContext::unbounded(&mut tt_b);
+        // Prior 1500 cp too high → the first window sits entirely above the truth.
+        let asp = aspiration_search(&mut b.clone(), &mut ctx, 6, full.score + 1500);
+        assert_eq!(asp.score, full.score, "widening failed to recover the true score");
+        assert!(ctx.asp_researches > 0, "expected re-searches after a bad prior");
     }
 }
