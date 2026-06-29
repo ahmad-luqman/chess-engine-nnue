@@ -95,6 +95,13 @@ fn is_repetition(hash: u64, halfmove: u16, rep: &[u64]) -> bool {
 /// misclassifies a positional score as a mate.
 const MATE_BOUND: i32 = MATE - 1000;
 
+/// Reverse-futility pruning (issue #38): the shallowest depths at which a node
+/// whose static eval clears `beta` by `RFP_MARGIN` per ply is assumed a fail-high
+/// and returned without searching. Kept low and the margin generous so the static
+/// eval has to be *clearly* winning — over-pruning here shows up as missed tactics.
+const RFP_MAX_DEPTH: u32 = 6;
+const RFP_MARGIN: i32 = 85;
+
 /// Adjust a mate score for *storage* in the TT. A mate score is "mate in N plies
 /// **from this node**", but the same position can be probed at a different
 /// distance from the root, so we store it relative to the node (add `ply` going
@@ -479,6 +486,10 @@ struct SearchContext<'a> {
     /// because the side to move was in check. A non-trivial count confirms the
     /// extension fires. Counts only; never affects the result.
     check_extensions: u64,
+    /// Reverse-futility diagnostics (issue #38): how many near-leaf nodes returned
+    /// early because the static eval cleared beta by a per-depth margin. Counts
+    /// only; never affects the result.
+    rfp_cutoffs: u64,
 }
 
 impl<'a> SearchContext<'a> {
@@ -503,6 +514,7 @@ impl<'a> SearchContext<'a> {
             null_cutoffs: 0,
             see_prunes: 0,
             check_extensions: 0,
+            rfp_cutoffs: 0,
         }
     }
 
@@ -609,6 +621,7 @@ pub fn search_timed(
         null_cutoffs: 0,
         see_prunes: 0,
         check_extensions: 0,
+        rfp_cutoffs: 0,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -808,6 +821,31 @@ fn negamax(
     }
     let child_depth = depth - 1 + ext;
 
+    // A PV node has a real (wider-than-null) window; the forward-pruning heuristics
+    // below stay clear of it (and of in-check nodes) so they never cut the
+    // principal variation or a forcing line. The static eval is the shared input
+    // to reverse-futility and null-move pruning, computed once here (it is
+    // meaningless in check, where both are disabled anyway).
+    let is_pv = beta - alpha > 1;
+    let static_eval = if in_check_node { -INF } else { ctx.evaluator.evaluate(board) };
+
+    // ── Reverse futility pruning / static null move (issue #38) ──────────────
+    // Near the leaf, if the static eval clears beta even after handing back a
+    // per-depth margin, the node is almost certainly a fail-high — so return
+    // without searching a move. Unlike NMP this passes no move and runs no search;
+    // it just trusts the eval, so it is kept to shallow depths with a generous
+    // margin. Skipped at PV nodes, in check, and against a mate-bound beta (a
+    // centipawn margin must not stand in for a mate proof).
+    if !is_pv
+        && !in_check_node
+        && depth <= RFP_MAX_DEPTH
+        && beta < MATE_BOUND
+        && static_eval - RFP_MARGIN * depth as i32 >= beta
+    {
+        ctx.rfp_cutoffs += 1;
+        return static_eval;
+    }
+
     // ── Null-move pruning (issue #36) ────────────────────────────────────────
     // Hand the opponent a *free* move (a null move); if a shallower search of the
     // resulting position still fails high, the real moves would too — so prune the
@@ -822,7 +860,7 @@ fn negamax(
         && !in_check_node
         && beta < MATE_BOUND
         && has_non_pawn_material(board, side)
-        && ctx.evaluator.evaluate(board) >= beta
+        && static_eval >= beta
     {
         ctx.null_attempts += 1;
         let r = if depth >= 6 { 3 } else { 2 };
@@ -1582,5 +1620,21 @@ mod tests {
         let b = board("2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1");
         let r = search(&b, 5);
         assert!(r.score >= MATE_BOUND, "expected a forced mate, got score {}", r.score);
+    }
+
+    /// Reverse-futility pruning fires: a normal middlegame searched through
+    /// iterative deepening hits near-leaf scout nodes whose static eval clears
+    /// beta by the margin in bulk. A zero count would mean the cutoff is dead.
+    #[test]
+    fn rfp_cutoffs_fire_in_a_middlegame() {
+        let b = board("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10");
+        let mut tt = TranspositionTable::new(16);
+        tt.new_search();
+        let mut ctx = SearchContext::unbounded(&mut tt);
+        let mut bb = b.clone();
+        for d in 1..=8 {
+            run_root(&mut bb, &mut ctx, d);
+        }
+        assert!(ctx.rfp_cutoffs > 0, "expected reverse-futility cutoffs, got {}", ctx.rfp_cutoffs);
     }
 }
