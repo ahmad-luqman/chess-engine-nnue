@@ -548,3 +548,100 @@ out as more depth in the same time. The **SPRT vs the current release is the
 acceptance gate**. Deferred refinements: a TT store on the null cutoff, a high-depth
 verification search for the zugzwang the material guard misses, and skipping NMP at
 PV nodes; `R` and the eval margin are candidates for Texel tuning (#42).
+
+## 9. SEE & check extensions — capture safety and forcing lines (`src/search.rs`, issue #39)
+
+Two unrelated selective-search additions that share an issue. **Static Exchange
+Evaluation** tells the search whether a capture actually *wins* material; **check
+extensions** stop a forcing line from being cut off mid-check.
+
+### The bet behind SEE
+
+Move ordering (§3) ranks captures by MVV-LVA — most valuable victim, least valuable
+attacker. But MVV-LVA only sees the first capture. `RxP` where the pawn is defended
+looks great (big victim relative to… a pawn) yet loses the rook on the recapture.
+SEE resolves the **whole** exchange on the target square: sit on the square, let
+each side recapture in turn with its cheapest attacker, and add up who comes out
+ahead. Now we can order losing captures last and skip them in quiescence.
+
+### The swap-off
+
+`see(board, mv)` walks the exchange:
+
+```text
+gain[0] = value(victim on `to`)
+on_square = value(the attacker that just moved there)
+repeat for the side to recapture:
+    pick its least valuable attacker of `to`   (none ⇒ stop)
+    gain[d] = on_square − gain[d-1]
+    on_square = value(that attacker); remove it from the occupancy
+fold back: gain[d-1] = −max(−gain[d-1], gain[d])   // stand-pat: decline a bad recapture
+return gain[0]
+```
+
+Three details earn their keep:
+
+- **X-ray reveal.** `attackers_to(sq, occupied)` is recomputed against the
+  *shrinking* occupancy each round, so a rook behind a rook (or a queen behind a
+  bishop) joins the exchange the moment the piece in front of it is removed. No
+  separate battery bookkeeping — the slider attack tables do it.
+- **Least valuable by piece-*type*, not value.** The king's `PIECE_VALUE` is 0, so
+  picking "cheapest by value" would recapture with the king first. Ordering by
+  `PieceType` index (Pawn=0 … King=5) ranks the king correctly as the recapturer of
+  last resort. A king may also only recapture into a square the opponent no longer
+  defends (otherwise it's moving into check).
+- **En passant.** The captured pawn isn't on the landing square — it's removed from
+  its own square before the swap-off begins.
+
+**v1 simplification:** promotions *inside* the sequence are ignored (a promoting
+pawn counts as a pawn). Both consumers use only the **sign** of SEE, so this never
+changes an ordering or pruning decision; the magnitude only matters for the future
+futility margins (#38).
+
+### Where SEE is used
+
+- **Ordering** (`move_score`): a non-promotion capture with `SEE < 0` returns its
+  negative SEE score, which lands it below every quiet move (history is `>= 0`) and
+  orders losing captures least-loss first. `SEE >= 0` keeps the MVV-LVA score; the
+  TT move is still tried first.
+- **Quiescence**: captures with `SEE < 0` are skipped — they can't lift the
+  stand-pat score, so there's no point making them (counted in `see_prunes`).
+
+### Check extensions
+
+A fixed depth limit can end a search exactly when the side to move is in check,
+dropping a position with the king under attack into quiescence — which stands pat
+on the static eval and so misreads it badly. The fix: when in check, search one ply
+*deeper*. The node's check status (already needed by the NMP and LMR gates, but
+previously computed only at `depth >= 3`) is now computed **unconditionally**,
+because the extension matters most at the frontier. `ext` is 1 in check and
+`child_depth = depth - 1 + ext` feeds every recursion site; in check LMR is off, so
+`ext` and a reduction `r` are never both set.
+
+### Why it can't recurse forever
+
+An extension makes `depth - 1 + 1 = depth` — the depth counter doesn't fall. A
+perpetual *cross-check* (both sides forever escaping with check) would never reach
+`depth == 0`. Repetition and the fifty-move rule end most such lines, but not always
+within the window, so a **selective-depth ceiling** — `if ply >= MAX_PLY { return
+eval }` at the top of `negamax` — is the hard backstop. It bounds recursion
+regardless of the cause and *is* the "extension cap". See ADR 0013.
+
+### Why no invariance test
+
+Both halves deliberately change the tree, so nothing is byte-equal to assert.
+Correctness is behavioural. SEE is pinned by hand-verified exchange fixtures (a SEE
+bug is silent — it just mis-orders and shows up as a flat SPRT), plus a `see_prunes`
+active-rate test. Check extensions get a `check_extensions` active-rate test and a
+no-regression forced-mate test — they only ever search deeper, so they can't drop a
+tactic. The one fixed-depth golden that moved is a PVS move-invariance case where
+SEE now surfaces a winning capture-with-check ahead of the old quiet tie-break.
+
+### What it buys
+
+SEE (ordering + qsearch pruning) is **+47.95 ± 16.05 Elo**, LLR 2.97, over the
+pre-SEE build (1400 games). Check extensions, SPRT'd separately on top:
+**+26.73 ± 11.41 Elo**, LLR 2.95, 2370 games. SEE is also a force-multiplier for
+the rest of Phase 3 — the
+futility/razoring pass (#38) will gate its pruning on SEE capture safety. The
+**SPRT vs the current release is the acceptance gate** for each (iron rule #3).
