@@ -102,6 +102,13 @@ const MATE_BOUND: i32 = MATE - 1000;
 const RFP_MAX_DEPTH: u32 = 6;
 const RFP_MARGIN: i32 = 85;
 
+/// Futility pruning (issue #38): at the shallowest depths, a late quiet move whose
+/// static eval plus this per-ply margin still can't reach `alpha` is skipped
+/// unsearched — it almost certainly can't raise alpha. The margin is the most a
+/// single quiet move is assumed worth; kept generous so real resources survive.
+const FUT_MAX_DEPTH: u32 = 2;
+const FUT_MARGIN: i32 = 150;
+
 /// Adjust a mate score for *storage* in the TT. A mate score is "mate in N plies
 /// **from this node**", but the same position can be probed at a different
 /// distance from the root, so we store it relative to the node (add `ply` going
@@ -490,6 +497,10 @@ struct SearchContext<'a> {
     /// early because the static eval cleared beta by a per-depth margin. Counts
     /// only; never affects the result.
     rfp_cutoffs: u64,
+    /// Futility diagnostics (issue #38): how many late quiet moves were skipped
+    /// unsearched because the static eval plus margin couldn't reach alpha. Counts
+    /// only; never affects the result.
+    fut_prunes: u64,
 }
 
 impl<'a> SearchContext<'a> {
@@ -515,6 +526,7 @@ impl<'a> SearchContext<'a> {
             see_prunes: 0,
             check_extensions: 0,
             rfp_cutoffs: 0,
+            fut_prunes: 0,
         }
     }
 
@@ -622,6 +634,7 @@ pub fn search_timed(
         see_prunes: 0,
         check_extensions: 0,
         rfp_cutoffs: 0,
+        fut_prunes: 0,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -882,6 +895,28 @@ fn negamax(
     for (i, mv) in moves.into_iter().enumerate() {
         ctx.rep.push(board.hash); // this position becomes an ancestor of the child
         let undo = board.make_move(mv);
+
+        // Futility pruning (issue #38): at the shallowest depths, a late quiet move
+        // whose static eval plus a margin still can't reach alpha is very unlikely
+        // to raise it, so skip the search entirely. Never the first move (`i >= 1`
+        // guarantees at least one move is searched, so no spurious fail-low), never
+        // tactical, never in check or against a mate-bound alpha, and — tested last,
+        // as it scans the post-make board — never a move that gives check.
+        if i >= 1
+            && depth <= FUT_MAX_DEPTH
+            && !is_pv
+            && !in_check_node
+            && alpha < MATE_BOUND
+            && !is_tactical(mv)
+            && static_eval + FUT_MARGIN * depth as i32 <= alpha
+            && !in_check(board, board.side_to_move)
+        {
+            ctx.fut_prunes += 1;
+            board.unmake_move(mv, undo);
+            ctx.rep.pop();
+            continue;
+        }
+
         let score = if i == 0 {
             // The first (best-ordered) move is the PV candidate: search it with
             // the full window so its exact score sets alpha for the scouts below.
@@ -1636,5 +1671,21 @@ mod tests {
             run_root(&mut bb, &mut ctx, d);
         }
         assert!(ctx.rfp_cutoffs > 0, "expected reverse-futility cutoffs, got {}", ctx.rfp_cutoffs);
+    }
+
+    /// Futility pruning fires: a middlegame searched through iterative deepening
+    /// reaches shallow scout nodes where the side to move is losing enough that
+    /// quiet moves can't reach alpha, so they're skipped in bulk.
+    #[test]
+    fn futility_prunes_fire_in_a_middlegame() {
+        let b = board("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10");
+        let mut tt = TranspositionTable::new(16);
+        tt.new_search();
+        let mut ctx = SearchContext::unbounded(&mut tt);
+        let mut bb = b.clone();
+        for d in 1..=8 {
+            run_root(&mut bb, &mut ctx, d);
+        }
+        assert!(ctx.fut_prunes > 0, "expected futility prunes, got {}", ctx.fut_prunes);
     }
 }
