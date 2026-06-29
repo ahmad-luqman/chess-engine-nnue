@@ -1085,13 +1085,18 @@ mod tests {
     #[test]
     fn pvs_is_result_invariant_with_tt_disabled() {
         // (fen, golden score, unique best move or None when many moves tie)
+        //
+        // Scores re-captured for tapered eval (#40): the two low-phase positions
+        // shifted (the rook ending 90→73, the won R-vs-Q ending 500→492) as the
+        // endgame king table blends in; the full-material positions and *every*
+        // best move are unchanged — tapering changes the number, not the decision.
         let cases: [(&str, i32, Option<&str>); 5] = [
             // Startpos scores 0 with many equal replies — assert score only.
             ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 0, None),
             ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 35, Some("e2a6")),
-            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 90, Some("b4f4")),
+            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 73, Some("b4f4")),
             ("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 25, Some("c3d5")),
-            ("4k3/8/8/8/3q4/8/8/3RK3 w - - 0 1", 500, Some("d1d4")),
+            ("4k3/8/8/8/3q4/8/8/3RK3 w - - 0 1", 492, Some("d1d4")),
         ];
         for (fen, score, best) in cases {
             let b = board(fen);
