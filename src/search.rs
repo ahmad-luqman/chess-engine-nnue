@@ -46,7 +46,7 @@
 
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::board::Board;
@@ -221,6 +221,39 @@ fn is_tactical(mv: Move) -> bool {
     mv.is_capture() || mv.promotion_piece().is_some()
 }
 
+/// Late-move-reduction table (issue #37): plies to shave off a late, quiet move's
+/// search, indexed `[depth][move_index]` (both clamped to 63). Reductions grow
+/// with depth and with how late the move is — `R = floor(0.75 + ln(d)·ln(i)/2)`.
+/// Built once at startup via [`init`].
+static LMR_TABLE: OnceLock<[[u8; 64]; 64]> = OnceLock::new();
+
+fn lmr_table() -> &'static [[u8; 64]; 64] {
+    LMR_TABLE.get_or_init(|| {
+        let mut t = [[0u8; 64]; 64];
+        for (depth, row) in t.iter_mut().enumerate().skip(1) {
+            for (moves, cell) in row.iter_mut().enumerate().skip(1) {
+                let r = 0.75 + (depth as f64).ln() * (moves as f64).ln() / 2.0;
+                *cell = r as u8; // floor for the positive value
+            }
+        }
+        t
+    })
+}
+
+/// Base LMR reduction (plies) for a late quiet move at this `depth` / `move_index`,
+/// before the caller clamps it to keep the reduced depth ≥ 1.
+fn lmr_reduction(depth: u32, move_index: usize) -> u32 {
+    lmr_table()[(depth as usize).min(63)][move_index.min(63)] as u32
+}
+
+/// Force the one-time table builds (LMR here; magics in [`crate::magic`]) at
+/// process startup, so the first search doesn't pay them on its own clock — see
+/// the magic-init lesson in `src/magic.rs`. Idempotent; called from `main`.
+pub fn init() {
+    lmr_table();
+    crate::magic::init();
+}
+
 /// The outcome of a search: the move to play and why.
 #[derive(Clone, Copy, Debug)]
 pub struct SearchResult {
@@ -271,6 +304,12 @@ struct SearchContext<'a> {
     /// only; they never affect the result.
     pvs_scouts: u64,
     pvs_researches: u64,
+    /// LMR diagnostics (issue #37): how many late quiet moves we searched at
+    /// reduced depth, and how many of those failed high and forced a full-depth
+    /// re-search. A low `researches / reductions` ratio means the reductions are
+    /// safe (rarely wrong); a high one means we're over-reducing. Counts only.
+    lmr_reductions: u64,
+    lmr_researches: u64,
 }
 
 impl<'a> SearchContext<'a> {
@@ -289,6 +328,8 @@ impl<'a> SearchContext<'a> {
             rep: Vec::new(),
             pvs_scouts: 0,
             pvs_researches: 0,
+            lmr_reductions: 0,
+            lmr_researches: 0,
         }
     }
 
@@ -370,6 +411,8 @@ pub fn search_timed(
         rep,
         pvs_scouts: 0,
         pvs_researches: 0,
+        lmr_reductions: 0,
+        lmr_researches: 0,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -542,6 +585,11 @@ fn negamax(
     let ply_idx = (ply as usize).min(MAX_PLY - 1);
     order_moves(&mut moves, board, tt_move, &ctx.killers[ply_idx], &ctx.history, side);
 
+    // Whether the side to move is in check — late-move reductions (#37) are
+    // suppressed in check (the node is tactical). Only computed at `depth >= 3`,
+    // the only depths LMR can fire, so shallow nodes skip the attack scan.
+    let in_check_node = depth >= 3 && in_check(board, side);
+
     let mut best_move = Move::NONE;
     for (i, mv) in moves.into_iter().enumerate() {
         ctx.rep.push(board.hash); // this position becomes an ancestor of the child
@@ -553,11 +601,43 @@ fn negamax(
         } else {
             // PVS scout (issue #34): a null window (alpha, alpha+1) only asks "is
             // this move worse than the PV?". A fail-low costs far less than a full
-            // search. On a fail-high — and only when our own window is wider than
-            // null (`s < beta`), else the scout already *is* the full window — the
-            // move may be a new PV, so re-search it full-width for its true score.
+            // search.
             ctx.pvs_scouts += 1;
-            let s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1);
+
+            // LMR (issue #37): a late, quiet, non-checking move is unlikely to be
+            // best, so search it *shallower* first. `r == 0` (any non-eligible
+            // move) leaves this identical to a plain PVS scout. The `gives_check`
+            // probe (`in_check` on the post-make board) is a non-incremental scan,
+            // so it sits last in the `&&` chain — only run once the cheap tests
+            // pass.
+            let mut r = 0u32;
+            if depth >= 3
+                && i >= 3
+                && !is_tactical(mv)
+                && !in_check_node
+                && mv != ctx.killers[ply_idx][0]
+                && mv != ctx.killers[ply_idx][1]
+                && !in_check(board, board.side_to_move)
+            {
+                // Clamp so the reduced depth (`depth - 1 - r`) stays ≥ 1.
+                r = lmr_reduction(depth, i).min(depth - 2);
+            }
+
+            let mut s = if r > 0 {
+                ctx.lmr_reductions += 1;
+                -negamax(board, ctx, depth - 1 - r, -alpha - 1, -alpha, ply + 1)
+            } else {
+                -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1)
+            };
+            // A reduced scout that beats alpha may have been over-reduced — verify
+            // at full depth (still the null window) before trusting it.
+            if !ctx.aborted && r > 0 && s > alpha {
+                ctx.lmr_researches += 1;
+                s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1);
+            }
+            // PVS: a full-depth null-window scout that beats alpha inside a *wide*
+            // window (`s < beta`, else the scout already is the full window) may be
+            // a new PV — re-search it full-width for its true score.
             if !ctx.aborted && s > alpha && s < beta {
                 ctx.pvs_researches += 1;
                 -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1)
@@ -988,6 +1068,53 @@ mod tests {
             "re-search rate too high: {} researches / {} scouts",
             ctx.pvs_researches,
             ctx.pvs_scouts
+        );
+    }
+
+    /// LMR must not drop a tactic the engine could previously find. These
+    /// fixtures were captured from the pre-LMR engine (PVS) at depth 7 — where it
+    /// finds each and LMR is genuinely engaged — and assert the *decisive* score
+    /// survives (a mate, or clearly winning). Asserting the score rather than an
+    /// exact move is robust to LMR's legitimate non-invariance.
+    #[test]
+    fn lmr_keeps_finding_known_tactics() {
+        // (fen, depth, minimum acceptable score)
+        let cases: [(&str, u32, i32); 4] = [
+            ("2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1", 7, MATE_BOUND), // mate 2
+            ("r2qrb2/p1pn1Qp1/1p4Nk/4PR2/3n4/7N/P5PP/R6K w - - 0 1", 7, MATE_BOUND),        // mate 2
+            ("1k1r4/pp1b1R2/3q2pp/4p3/2B5/4Q3/PPP2B2/2K5 b - - 0 1", 7, MATE_BOUND),         // mate 3
+            ("2r1nrk1/p4p1p/1p2p1pQ/nP6/2pNP3/P1B2q1P/2B2P2/R4RK1 w - - 0 1", 7, 800),       // +1150
+        ];
+        for (fen, depth, min_score) in cases {
+            let r = search(&board(fen), depth);
+            assert!(
+                r.score >= min_score,
+                "LMR dropped a tactic in {fen}: score {} < {min_score}",
+                r.score
+            );
+        }
+    }
+
+    /// LMR is actually firing and its reductions are mostly safe: on a normal
+    /// middlegame searched through iterative deepening (so the TT seeds ordering),
+    /// reductions happen in bulk and only a minority fail high and force a
+    /// full-depth re-search. A high re-search rate would mean we over-reduce.
+    #[test]
+    fn lmr_reductions_fire_and_research_rate_is_bounded() {
+        let b = board("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10");
+        let mut tt = TranspositionTable::new(16);
+        tt.new_search();
+        let mut ctx = SearchContext::unbounded(&mut tt);
+        let mut bb = b.clone();
+        for d in 1..=8 {
+            run_root(&mut bb, &mut ctx, d);
+        }
+        assert!(ctx.lmr_reductions > 1000, "expected many reductions, got {}", ctx.lmr_reductions);
+        assert!(
+            ctx.lmr_researches * 2 < ctx.lmr_reductions,
+            "LMR re-search rate too high (over-reducing): {} researches / {} reductions",
+            ctx.lmr_researches,
+            ctx.lmr_reductions
         );
     }
 }
