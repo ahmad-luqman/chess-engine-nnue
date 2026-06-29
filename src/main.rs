@@ -21,6 +21,12 @@ use engine::perft::perft_divide;
 const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 fn main() -> ExitCode {
+    // Build the magic sliding-attack tables now, at process startup, so the
+    // ~130 ms one-time cost is paid before any search (or perft) clock starts.
+    // Lazily building them on the first move instead bills that time to the
+    // move's budget and, at a short time control, truncates it to depth 1.
+    engine::magic::init();
+
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("perft") => run_perft(&args[2..]),

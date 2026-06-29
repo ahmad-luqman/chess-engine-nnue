@@ -22,7 +22,13 @@
 //! silently (only perft would catch it). Instead we *find* magics at first use
 //! with a fixed-seed PRNG and **verify every candidate against the ray-walk
 //! oracle** before accepting it. Same determinism (fixed seed), but correct by
-//! construction. Build cost is a few milliseconds, paid once via [`OnceLock`].
+//! construction.
+//!
+//! The search costs ~130 ms in release (the oracle-verified trial loop over all
+//! 128 squares), paid once via [`OnceLock`]. That is small over a game but large
+//! against a single move's clock, so the binary calls [`init`] at startup to pay
+//! it *before* any `go` — otherwise the first search bills it to its own time
+//! budget and, at a short time control, returns after only depth 1.
 
 use std::sync::OnceLock;
 
@@ -61,6 +67,14 @@ static MAGICS: OnceLock<Magics> = OnceLock::new();
 
 fn magics() -> &'static Magics {
     MAGICS.get_or_init(build)
+}
+
+/// Force the one-time magic-table build now, rather than lazily on the first
+/// attack lookup. The binary calls this at startup so the ~130 ms build is paid
+/// off the clock — before any search's time budget starts. Idempotent (the
+/// underlying [`OnceLock`] builds at most once); safe to call more than once.
+pub fn init() {
+    magics();
 }
 
 /// Squares a rook on `sq` attacks given `occupied` — magic lookup.
@@ -133,19 +147,30 @@ fn build_square(sq: Square, dirs: &[(i8, i8)], rng: &mut u64) -> SquareMagic {
 
     // Try magics until one maps every subset without a *harmful* collision (two
     // subsets sharing an index but needing different attack sets).
+    //
+    // The table and the "written this trial?" marks are allocated *once* and
+    // reused across trials: an `epoch` counter bumped per trial means a slot is
+    // live iff `stamp[idx] == epoch`, so we never re-zero between attempts. (The
+    // old code allocated and zeroed two `size`-length vecs *per* trial — with
+    // 4096-entry rook tables and dozens of trials per square that zeroing
+    // dominated the whole build.) Unused slots are never read: a real occupancy
+    // `occupied & mask` is always one of the enumerated subsets, so its index was
+    // written this epoch.
+    let mut table = vec![Bitboard::EMPTY; size];
+    let mut stamp = vec![0u32; size];
+    let mut epoch = 0u32;
     loop {
         let magic = sparse_rand(rng);
         // Cheap reject: a good magic spreads the top bits of mask*magic.
         if (mask.wrapping_mul(magic) >> 56).count_ones() < 6 {
             continue;
         }
-        let mut table = vec![Bitboard::EMPTY; size];
-        let mut filled = vec![false; size];
+        epoch += 1;
         let mut ok = true;
         for (i, &occ) in subsets.iter().enumerate() {
             let idx = (occ.wrapping_mul(magic) >> shift) as usize;
-            if !filled[idx] {
-                filled[idx] = true;
+            if stamp[idx] != epoch {
+                stamp[idx] = epoch;
                 table[idx] = reference[i];
             } else if table[idx] != reference[i] {
                 ok = false;
