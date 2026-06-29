@@ -4,7 +4,7 @@ Phase 2 turns the Phase 1 toy searcher into a *real* engine: a position identity
 it can cache and compare (Zobrist), a transposition table, principled move
 ordering, quiescence at the leaves, and draw detection. This is the running
 deep-dive for that work — one section lands per issue (#23–#28), now continuing
-into Phase 3's selective search (§6 PVS #34, §7 LMR #37). It assumes the
+into Phase 3's selective search (§6 PVS #34, §7 LMR #37, §8 NMP #36). It assumes the
 board and move machinery from [05-board-representation.md](05-board-representation.md)
 and [06-move-generation.md](06-move-generation.md), and the Phase 1 negamax in
 `src/search.rs`.
@@ -464,3 +464,87 @@ payoff PVS was laying groundwork for, and the combined PVS+LMR SPRT vs v0.5.0 is
 acceptance gate for both. Later refinements — SEE-gated reductions (#39),
 history-scaled reductions (#25) — reduce more for moves that look bad and less for
 moves that look good; they're deferred to keep this first signal clean.
+
+---
+
+## 8. Null-move pruning — pruning whole nodes (`src/search.rs`, issue #36)
+
+PVS and LMR made the tree *deeper*; NMP makes it *narrower*. The bet: hand the
+opponent a *free* move (a "null move" — pass without moving), and search the result
+shallower. If even after giving away a tempo we're still doing well enough to fail
+high (`>= beta`), then our real moves — which beat passing — would too. So we return
+the cutoff without searching a single real move. This is one of the biggest single
+pruning wins in a classical engine.
+
+### The null move itself
+
+`Board::make_null_move` (`src/board.rs`) changes exactly two things: it flips the
+side to move and clears the en-passant square (a pass can't be answered by an ep
+capture, since no pawn just double-pushed). Both are XORed into the incremental
+Zobrist key the same way `make_move` does — drop the old ep contribution, toggle the
+side key, add the new ep contribution (now zero). A `debug_assert` against a
+from-scratch recompute guards the key math, and `unmake_null_move` restores the
+pre-null snapshot in O(1).
+
+### The prune
+
+NMP sits in `negamax` after the terminal / fifty-move / `depth == 0` checks (so the
+node is known non-terminal) and before move ordering (a cutoff skips that work):
+
+```text
+if eligible:
+    s = -negamax(depth-1-R, -beta, -beta+1)   // opponent moves; we passed
+    if s >= beta: return beta                  // fail-hard cutoff
+```
+
+`R` is the *reduction* — 2, rising to 3 at `depth >= 6` — so the verification search
+is cheap. We return `beta`, never the null search's score.
+
+### Who's eligible — and the zugzwang guard
+
+Five gates, cheapest first: `null_ok` (see below), `depth >= 3`, not in check,
+`beta < MATE_BOUND`, the side to move has **non-pawn material**, and the static
+`eval >= beta`.
+
+The non-pawn-material gate is the **zugzwang guard**, and it's the heart of NMP's
+correctness. In king-and-pawn endings, passing is sometimes *better* than any legal
+move (every move worsens your position) — exactly the assumption NMP inverts, so a
+null move there can prune a line that's actually lost. Requiring a knight, bishop,
+rook, or queen on the moving side makes that pathology vanishingly rare. (A test
+searches a K+P vs K ending and asserts **zero** null attempts.)
+
+The `eval >= beta` gate restricts pruning to nodes that already look winning — where
+"even a free move keeps us ahead" is plausible — and skips the wasted null search
+everywhere else.
+
+### Two correctness traps
+
+- **Never two null moves in a row.** Passing twice is a no-op that searches the same
+  position at lower depth and breaks the verification logic. We forbid it with a
+  `null_ok` *parameter* threaded through `negamax`: `false` only for the immediate
+  null child, `true` for every real-move recursion. A parameter (vs a shared
+  `SearchContext` flag) expresses "no two in a row" precisely with no
+  restore-on-every-path hazard.
+- **No fabricated mates.** A null search can report an inflated mate score (the side
+  that passed gets mated sooner). Gating on `beta < MATE_BOUND` and returning `beta`
+  (not the null score) means a mate distance can never enter the tree through a null
+  cutoff.
+
+### Why no invariance test
+
+Like LMR, NMP **deliberately** changes the fixed-depth result, so there's nothing to
+assert byte-equal. Correctness is behavioural: a tactical suite (the LMR mates +
+winning position) asserts no dropped win, a counter test asserts `null_attempts` /
+`null_cutoffs` fire in bulk, and the pawn-endgame test pins the zugzwang guard. The
+incremental key is checked by comparing a made null move against a *freshly parsed*
+post-null position — the one assertion a round-trip can't make, since `unmake`
+restores a snapshot regardless of whether the forward math was right.
+
+### What it buys
+
+Large node savings at equal depth: from the start position, depth 10 drops 723k →
+510k nodes (−30%) and depth 9 415k → 185k (−55%) vs the pre-NMP build — which cashes
+out as more depth in the same time. The **SPRT vs the current release is the
+acceptance gate**. Deferred refinements: a TT store on the null cutoff, a high-depth
+verification search for the zugzwang the material guard misses, and skipping NMP at
+PV nodes; `R` and the eval margin are candidates for Texel tuning (#42).
