@@ -3,13 +3,14 @@
 Phased plan. Each phase ends in a *playable, testable* milestone. Elo figures
 are rough order-of-magnitude targets, not promises.
 
-> **Current phase: 3 — Selective search + tuned eval.** Phases 0–2 complete.
-> Phase 2 shipped Zobrist hashing, a transposition table, move ordering,
-> quiescence, draw detection, and magic bitboards (issues #23–#28); see
-> [08-search-internals.md](08-search-internals.md). Cumulative SPRT gains over
-> the Phase 1 release (v0.1.0): TT + ordering **+249 Elo** (v0.2.0), quiescence
-> **+208** (v0.3.0), draw detection **+65** (v0.4.0), magic bitboards **+55**
-> (v0.5.0).
+> **Current phase: 4 — NNUE evaluation.** Phases 0–3 complete. Phase 3 shipped the
+> selective-search core and a tuned hand-crafted eval (issues #34–#42), each
+> SPRT-verified — see [08-search-internals.md](08-search-internals.md) and the ADRs.
+> Search side: PVS, LMR, null-move pruning, SEE + check extensions (**+47.95**,
+> **+26.73**), reverse-futility (**+76.92**) + futility (**+110.53**) pruning, and
+> aspiration windows (**+53.45**). Eval side: tapered eval, hand-crafted terms, and
+> Texel tuning. Phase 2 (v0.5.0) shipped Zobrist hashing, a transposition table,
+> move ordering, quiescence, draw detection, and magic bitboards (issues #23–#28).
 
 | Phase | Goal | Deliverable | Rough Elo |
 |-------|------|-------------|-----------|

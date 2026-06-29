@@ -63,10 +63,12 @@ cargo clippy --all-targets
 
 Phased plan in [`docs/03-roadmap.md`](docs/03-roadmap.md). Work is tracked as
 GitHub issues: epics (one per phase) with native sub-issues, labelled `phase-*`
-and `type:*`. Current phase: **3 — selective search + tuned eval** (Phases 0–2
-complete: perft passes, and the Phase 2 search core — Zobrist, TT, move ordering,
-quiescence, draw detection, magic bitboards — is in; see
-[`docs/08-search-internals.md`](docs/08-search-internals.md)).
+and `type:*`. Current phase: **4 — NNUE evaluation** (Phases 0–3 complete). Phase 3
+shipped the selective-search core (PVS, LMR, null-move pruning, SEE + check
+extensions, reverse-futility + futility pruning, aspiration windows) and a tuned
+hand-crafted eval (tapered eval, hand-crafted terms, Texel tuning) — issues
+#34–#42, each SPRT-verified; see
+[`docs/08-search-internals.md`](docs/08-search-internals.md) and the ADRs.
 
 ## Conventions
 
