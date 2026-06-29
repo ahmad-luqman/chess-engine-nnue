@@ -20,7 +20,12 @@
 # …but the curated SPRT opening book is committed (issue #31); allowlist it.
 # This negation must stay after `*.epd` — later patterns win.
 !/books/openings.epd
-/data/
+# Ignore the data dir's contents (datasets are large), but keep a small committed
+# Texel sample (issue #42) so the tuner can be smoke-run without a multi-GB set.
+# `/data/*` (not `/data/`) is required: git won't descend into a fully-excluded
+# directory, so a file negation can only re-include when the dir itself isn't excluded.
+/data/*
+!/data/texel_sample.txt
 /nets/
 
 # Match-runner (fastchess/cutechess) artifacts written into the working dir.

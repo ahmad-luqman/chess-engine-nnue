@@ -249,6 +249,62 @@ several iterations against. Criterion flags each change `improved` / `regressed`
 past a noise threshold, so looks-like-a-win noise doesn't fool you — the same
 discipline as iron rule #3, applied to speed.
 
+## Texel tuning the eval (issue #42)
+
+The hand-crafted `(mg, eg)` weights (#40/#41) are fitted, not guessed, by **Texel
+tuning**: minimise the logistic error of the static eval against game-outcome
+labels. Two offline examples drive it; the engine keeps baked `const` weights and
+we paste the tuned values back in.
+
+**1. Get a labelled dataset.** Dataset quality is the whole game — a noisy or
+small set makes tuning *regress* (it did, on a first attempt). Two sources, both
+parsed by the tuner:
+
+- **Recommended — a public real-game set.** The canonical
+  [zurichess `quiet-labeled.epd`](https://github.com/KierenP/ChessTrainingSets)
+  (~725k quiet positions from real games, EPD lines `… c9 "1-0|0-1|1/2-1/2";`,
+  White-POV result). Diverse and high-quality — this is what produced the shipped
+  weights.
+
+  ```
+  curl -sL https://raw.githubusercontent.com/KierenP/ChessTrainingSets/master/quiet-labeled.epd \
+    -o data/quiet-labeled.epd
+  ```
+
+- **Or self-play** (reproducible, but a small set overfits — see the regression
+  note in [ADR 0012](decisions/0012-texel-tuning.md)):
+
+  ```
+  cargo run --release --example gen_data -- 200000 6 1 > data/texel.txt
+  ```
+
+  Seeded self-play with random opening plies for diversity; lines are
+  `FEN RESULT` (`RESULT ∈ {1.0,0.5,0.0}`, White-POV), kept only when
+  `engine::search::is_quiet` holds (qsearch == static eval, not in check).
+
+Datasets are gitignored — **commit the tuned *constants*, not the data.**
+
+**2. Tune** — fit the weights and print them as Rust:
+
+```
+cargo run --release --example texel -- data/texel.txt > tuned.rs
+```
+
+The eval is linear in its weights, so each position is reduced to a sparse feature
+trace (the white-relative mg/eg coefficient of every weight) and the fit is Adam
+gradient descent over `Σ (result − sigmoid(K·eval))²`, solving `K` first.
+`PIECE_VALUE` is held fixed (pawn = 100 anchors `K`; the PST absorbs material
+drift). A train/val split is reported — a growing val/train gap is the overfit
+signal to watch. A **consistency check** asserts the trace reproduces
+`Material::evaluate` exactly on every position before tuning, so the tuner can't
+silently optimise the wrong function.
+
+**3. Apply + verify.** Paste the emitted constants into `src/eval.rs`, then the
+usual gate: `cargo test` / `clippy` / `fmt`, and **`scripts/sprt.sh <prev-tag>`** —
+the tuned weights ship only on an SPRT pass (iron rule #3). A small sample dataset
+([`data/texel_sample.txt`](../data/texel_sample.txt)) is committed so the pipeline
+can be smoke-run without regenerating the full set.
+
 ## See also
 
 - [03-roadmap.md](03-roadmap.md) — the phased plan and the working method.

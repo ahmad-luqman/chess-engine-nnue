@@ -49,9 +49,9 @@ use crate::types::{Color, PieceType, Square};
 /// is known. A plain struct (not bit-packing) — the optimiser folds the two fields
 /// and it keeps #41/#42 readable.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-struct Score {
-    mg: i32,
-    eg: i32,
+pub struct Score {
+    pub mg: i32,
+    pub eg: i32,
 }
 
 impl Score {
@@ -179,10 +179,10 @@ fn side_score(board: &Board, color: Color) -> Score {
 // time, each SPRT-gated, so a regression is attributable to a single term.
 
 /// Bonus for holding the **bishop pair**: two bishops cover both colour complexes
-/// and are worth more than the sum of the parts, especially in open endgames — so
-/// the endgame weight is the larger of the two. Awarded once a side has ≥ 2
+/// and are worth more than the sum of the parts. Awarded once a side has ≥ 2
 /// bishops (the common case is exactly two; more only arise via promotion).
-const BISHOP_PAIR: Score = Score { mg: 30, eg: 45 };
+/// (Texel-tuned, #42.)
+pub const BISHOP_PAIR: Score = Score { mg: 53, eg: 54 };
 
 fn bishop_pair(board: &Board, color: Color) -> Score {
     let bishops = board.pieces(PieceType::Bishop).intersect(board.color(color));
@@ -197,8 +197,8 @@ fn bishop_pair(board: &Board, color: Color) -> Score {
 /// **semi-open** file (no *friendly* pawn, but an enemy pawn present). Open files
 /// are a rook's highways into the enemy position; the bonus is larger in the
 /// middlegame, when there is more along the file to pressure.
-const ROOK_OPEN_FILE: Score = Score { mg: 25, eg: 10 };
-const ROOK_SEMI_OPEN_FILE: Score = Score { mg: 12, eg: 5 };
+pub const ROOK_OPEN_FILE: Score = Score { mg: 69, eg: -11 };
+pub const ROOK_SEMI_OPEN_FILE: Score = Score { mg: 27, eg: 11 };
 
 fn rook_files(board: &Board, color: Color) -> Score {
     let own_pawns = board.pieces(PieceType::Pawn).intersect(board.color(color));
@@ -224,13 +224,13 @@ fn rook_files(board: &Board, color: Color) -> Score {
 /// so its huge reach doesn't swamp the term. This is cheap *pseudo*-mobility (it
 /// doesn't exclude enemy-controlled squares); eval runs at every qsearch leaf, so
 /// the attack lookups are kept to one per piece. Indexed by [`PieceType::index`].
-const MOBILITY: [Score; 6] = [
-    Score { mg: 0, eg: 0 }, // Pawn — not counted
-    Score { mg: 4, eg: 4 }, // Knight
-    Score { mg: 4, eg: 4 }, // Bishop
-    Score { mg: 2, eg: 4 }, // Rook
-    Score { mg: 1, eg: 2 }, // Queen
-    Score { mg: 0, eg: 0 }, // King — not counted
+pub const MOBILITY: [Score; 6] = [
+    Score { mg: 0, eg: 0 },  // Pawn — not counted
+    Score { mg: 2, eg: -8 }, // Knight
+    Score { mg: 7, eg: 2 },  // Bishop
+    Score { mg: 2, eg: 6 },  // Rook
+    Score { mg: 1, eg: 10 }, // Queen
+    Score { mg: 0, eg: 0 },  // King — not counted
 ];
 
 fn mobility(board: &Board, color: Color) -> Score {
@@ -261,12 +261,15 @@ fn mobility(board: &Board, color: Color) -> Score {
 /// **Passed** pawns (no enemy pawn ahead on the same or adjacent files) are
 /// strong, more so the closer to promotion and the deeper into the endgame, so the
 /// bonus rises with rank and tapers toward `eg`.
-const DOUBLED_PAWN: Score = Score { mg: -10, eg: -20 };
-const ISOLATED_PAWN: Score = Score { mg: -12, eg: -8 };
+pub const DOUBLED_PAWN: Score = Score { mg: 5, eg: -20 };
+pub const ISOLATED_PAWN: Score = Score { mg: -25, eg: -8 };
 /// Passed-pawn bonus indexed by the pawn's rank *from its own side* (0 = home rank,
-/// 6 = one step from promotion). Index 0 and 7 are unreachable for a pawn.
-const PASSED_PAWN_MG: [i32; 8] = [0, 5, 10, 15, 25, 40, 60, 0];
-const PASSED_PAWN_EG: [i32; 8] = [0, 10, 15, 25, 40, 65, 100, 0];
+/// 6 = one step from promotion). Index 0 and 7 are unreachable for a pawn. Texel
+/// tuning (#42) put almost all the value in the endgame (`eg`) — a passed pawn is
+/// a promotion threat once the heavy pieces are gone — and near zero in the
+/// middlegame, where it can equally be a target.
+pub const PASSED_PAWN_MG: [i32; 8] = [0, 5, -4, -11, 14, 31, 37, 0];
+pub const PASSED_PAWN_EG: [i32; 8] = [0, 9, 12, 41, 67, 148, 196, 0];
 
 fn pawn_structure(board: &Board, color: Color) -> Score {
     let own_pawns = board.pieces(PieceType::Pawn).intersect(board.color(color));
@@ -309,9 +312,13 @@ fn pawn_structure(board: &Board, color: Color) -> Score {
 ///
 /// `eg == 0`: in the endgame the king is a fighting piece, not a target (the
 /// counterpart to the centralising [`KING_EG`] table).
-const KING_ATTACK_WEIGHT: [i32; 6] = [0, 2, 2, 3, 5, 0]; // P,N,B,R,Q,K
-const KING_DANGER_PER_UNIT: i32 = 4;
-const PAWN_SHIELD_HOLE: i32 = 12;
+///
+/// The per-piece weights are in **centipawns directly** (the old design multiplied
+/// raw "attack units" by a separate `KING_DANGER_PER_UNIT` scalar; folding that
+/// constant in makes the term *linear* in its weights — `penalty = -Σ weight·count`
+/// — which Texel tuning #42 requires, and is exactly score-preserving).
+pub const KING_ATTACK_WEIGHT: [i32; 6] = [0, 20, 21, 14, 13, 0]; // P,N,B,R,Q,K (centipawns, Texel-tuned #42)
+pub const PAWN_SHIELD_HOLE: i32 = 35;
 
 fn king_safety(board: &Board, color: Color) -> Score {
     let king_sq = king_square(board, color);
@@ -320,7 +327,7 @@ fn king_safety(board: &Board, color: Color) -> Score {
     let enemy = color.flip();
 
     // Zone pressure: each enemy piece that attacks into the king ring adds its
-    // weight in "attack units".
+    // weight (in centipawns) to the danger total.
     let mut units = 0;
     for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
         let mut bb = board.pieces(pt).intersect(board.color(enemy));
@@ -348,7 +355,7 @@ fn king_safety(board: &Board, color: Color) -> Score {
         }
     }
 
-    Score { mg: -(units * KING_DANGER_PER_UNIT + holes * PAWN_SHIELD_HOLE), eg: 0 }
+    Score { mg: -(units + holes * PAWN_SHIELD_HOLE), eg: 0 }
 }
 
 // ── File / pawn masks (issue #41) ───────────────────────────────────────────
@@ -358,7 +365,7 @@ fn king_safety(board: &Board, color: Color) -> Score {
 
 /// `FILE_MASKS[f]` is every square on file `f` (a = 0 … h = 7). Used for rook
 /// open/semi-open files and for doubled/isolated pawn detection (#41).
-const FILE_MASKS: [Bitboard; 8] = {
+pub const FILE_MASKS: [Bitboard; 8] = {
     let mut masks = [Bitboard(0); 8];
     let mut f = 0;
     while f < 8 {
@@ -376,7 +383,7 @@ const FILE_MASKS: [Bitboard; 8] = {
 
 /// `ADJACENT_FILE_MASKS[f]` is the files immediately left and right of `f` (not `f`
 /// itself). A pawn on file `f` is **isolated** when no friendly pawn intersects it.
-const ADJACENT_FILE_MASKS: [Bitboard; 8] = {
+pub const ADJACENT_FILE_MASKS: [Bitboard; 8] = {
     let mut m = [Bitboard(0); 8];
     let mut f = 0;
     while f < 8 {
@@ -398,7 +405,7 @@ const ADJACENT_FILE_MASKS: [Bitboard; 8] = {
 /// (White toward rank 8, Black toward rank 1). A pawn is **passed** when no enemy
 /// pawn occupies its mask — nothing can block it or capture it on the way to
 /// promotion. Indexed `[Color::index()][Square::0]`.
-const PASSED_MASKS: [[Bitboard; 64]; 2] = {
+pub const PASSED_MASKS: [[Bitboard; 64]; 2] = {
     let mut masks = [[Bitboard(0); 64]; 2];
     let mut sq = 0;
     while sq < 64 {
@@ -431,7 +438,7 @@ const PASSED_MASKS: [[Bitboard; 64]; 2] = {
 };
 
 /// Full-material game phase, the highest value [`game_phase`] returns.
-const PHASE_MAX: i32 = 24;
+pub const PHASE_MAX: i32 = 24;
 
 /// The game phase in `[0, PHASE_MAX]`: a measure of how much non-pawn material is
 /// left, summed over **both** sides with the classic weights (Q=4, R=2, B=N=1).
@@ -467,70 +474,71 @@ fn pst_index(color: Color, sq: Square) -> usize {
 /// [`PieceType::index`] (Pawn=0 … Queen=4) then by board square in
 /// **rank-8-first** layout (index 0 = a8 … 63 = h1) — see [`pst_index`].
 ///
-/// These are Tomasz Michniewski's "Simplified Evaluation Function" tables, a
-/// well-known public-domain starting point. They are written from White's
-/// perspective; Black reuses them mirrored (again, see [`pst_index`]). The same
-/// table serves both game phases for these pieces (so their `mg == eg`); only the
-/// king splits into [`KING_MG`] / [`KING_EG`] (issue #40).
+/// Originally Tomasz Michniewski's "Simplified Evaluation Function" tables, now
+/// **Texel-tuned** (#42) against ~200k self-play quiet positions. They are written
+/// from White's perspective; Black reuses them mirrored (again, see [`pst_index`]).
+/// The same table serves both game phases for these pieces (so their `mg == eg`);
+/// only the king splits into [`KING_MG`] / [`KING_EG`] (issue #40), and the king
+/// tables were held fixed during tuning (too few king samples per position).
 ///
 /// `rustfmt::skip` keeps each table laid out as a readable 8×8 board (rank per
 /// line); without it rustfmt collapses them into an unreadable flat run.
 #[rustfmt::skip]
-const PIECE_SQUARE_TABLE: [[i32; 64]; 5] = [
-    // Pawn — reward central advances; discourage the f2/g2 squares weakening.
+pub const PIECE_SQUARE_TABLE: [[i32; 64]; 5] = [
+    // Pawn
     [
-          0,   0,   0,   0,   0,   0,   0,   0,
-         50,  50,  50,  50,  50,  50,  50,  50,
-         10,  10,  20,  30,  30,  20,  10,  10,
-          5,   5,  10,  25,  25,  10,   5,   5,
-          0,   0,   0,  20,  20,   0,   0,   0,
-          5,  -5, -10,   0,   0, -10,  -5,   5,
-          5,  10,  10, -20, -20,  10,  10,   5,
-          0,   0,   0,   0,   0,   0,   0,   0,
+           0,    0,    0,    0,    0,    0,    0,    0,
+         102,   93,   65,   48,   50,   53,   60,   87,
+          53,   46,   32,    3,    3,   28,   37,   39,
+          31,   24,   16,   13,   15,   14,   18,   15,
+          14,   10,   11,   14,   14,    5,    4,   -1,
+          10,    6,    9,    1,   11,    9,    7,    0,
+           7,    6,   -3,  -13,   -3,   19,   13,   -5,
+           0,    0,    0,    0,    0,    0,    0,    0,
     ],
-    // Knight — strongly central; corners and edges are poor.
+    // Knight
     [
-        -50, -40, -30, -30, -30, -30, -40, -50,
-        -40, -20,   0,   0,   0,   0, -20, -40,
-        -30,   0,  10,  15,  15,  10,   0, -30,
-        -30,   5,  15,  20,  20,  15,   5, -30,
-        -30,   0,  15,  20,  20,  15,   0, -30,
-        -30,   5,  10,  15,  15,  10,   5, -30,
-        -40, -20,   0,   5,   5,   0, -20, -40,
-        -50, -40, -30, -30, -30, -30, -40, -50,
+         -44,   30,   69,   49,   74,   33,   18,  -50,
+          34,   71,  114,  113,  101,   99,   69,   28,
+          55,  113,  137,  146,  144,  149,  116,   68,
+          79,  117,  140,  151,  134,  151,  111,   91,
+          77,  107,  134,  134,  139,  132,  116,   84,
+          70,   96,  117,  131,  134,  128,  114,   77,
+          57,   59,   92,  110,  111,  105,   72,   69,
+          20,   72,   64,   72,   79,   74,   75,   29,
     ],
-    // Bishop — long diagonals; avoid getting stuck on the back rank.
+    // Bishop
     [
-        -20, -10, -10, -10, -10, -10, -10, -20,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -10,   0,   5,  10,  10,   5,   0, -10,
-        -10,   5,   5,  10,  10,   5,   5, -10,
-        -10,   0,  10,  10,  10,  10,   0, -10,
-        -10,  10,  10,  10,  10,  10,  10, -10,
-        -10,   5,   0,   0,   0,   0,   5, -10,
-        -20, -10, -10, -10, -10, -10, -10, -20,
+          32,   45,   27,   42,   50,   40,   41,   33,
+          41,   54,   51,   42,   58,   67,   56,   21,
+          49,   64,   67,   63,   59,   69,   72,   55,
+          57,   60,   69,   75,   72,   68,   57,   56,
+          55,   62,   61,   77,   70,   57,   58,   60,
+          52,   68,   73,   65,   71,   75,   69,   54,
+          56,   72,   65,   63,   72,   68,   86,   49,
+          36,   59,   53,   55,   55,   56,   46,   40,
     ],
-    // Rook — the 7th rank and central files; small penalty on the a/h edges.
+    // Rook
     [
-          0,   0,   0,   0,   0,   0,   0,   0,
-          5,  10,  10,  10,  10,  10,  10,   5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-         -5,   0,   0,   0,   0,   0,   0,  -5,
-          0,   0,   0,   5,   5,   0,   0,   0,
+         133,  131,  134,  133,  134,  128,  132,  126,
+         136,  138,  141,  140,  134,  140,  135,  135,
+         127,  131,  126,  127,  119,  125,  129,  119,
+         122,  119,  129,  120,  122,  129,  118,  121,
+         112,  121,  123,  119,  119,  113,  121,  108,
+         106,  114,  112,  114,  115,  115,  116,   99,
+         103,  116,  116,  121,  118,  121,  111,   85,
+         118,  120,  124,  126,  125,  134,  103,  110,
     ],
-    // Queen — mild central preference; nothing drastic.
+    // Queen
     [
-        -20, -10, -10,  -5,  -5, -10, -10, -20,
-        -10,   0,   0,   0,   0,   0,   0, -10,
-        -10,   0,   5,   5,   5,   5,   0, -10,
-         -5,   0,   5,   5,   5,   5,   0,  -5,
-          0,   0,   5,   5,   5,   5,   0,  -5,
-        -10,   5,   5,   5,   5,   5,   0, -10,
-        -10,   0,   5,   0,   0,   0,   0, -10,
-        -20, -10, -10,  -5,  -5, -10, -10, -20,
+         277,  309,  317,  313,  341,  332,  327,  341,
+         272,  261,  299,  317,  314,  336,  331,  347,
+         286,  283,  292,  312,  333,  347,  349,  352,
+         288,  280,  291,  287,  313,  317,  328,  313,
+         293,  288,  296,  298,  305,  308,  315,  310,
+         290,  303,  305,  306,  308,  310,  321,  314,
+         282,  297,  316,  315,  324,  316,  289,  310,
+         299,  290,  300,  321,  303,  294,  280,  258,
     ],
 ];
 
@@ -538,7 +546,7 @@ const PIECE_SQUARE_TABLE: [[i32; 64]; 5] = [
 /// queens and rooks are on. Same Michniewski source and rank-8-first layout as
 /// [`PIECE_SQUARE_TABLE`]; read into a [`Score`]'s `mg` field.
 #[rustfmt::skip]
-const KING_MG: [i32; 64] = [
+pub const KING_MG: [i32; 64] = [
     -30, -40, -40, -50, -50, -40, -40, -30,
     -30, -40, -40, -50, -50, -40, -40, -30,
     -30, -40, -40, -50, -50, -40, -40, -30,
@@ -554,7 +562,7 @@ const KING_MG: [i32; 64] = [
 /// into a [`Score`]'s `eg` field; tapering (issue #40) blends it in as material
 /// leaves the board. (Michniewski's endgame king table.)
 #[rustfmt::skip]
-const KING_EG: [i32; 64] = [
+pub const KING_EG: [i32; 64] = [
     -50, -40, -30, -20, -20, -30, -40, -50,
     -30, -20, -10,   0,   0, -10, -20, -30,
     -30, -10,  20,  30,  30,  20, -10, -30,
@@ -583,12 +591,13 @@ mod tests {
 
     #[test]
     fn material_dominates_a_missing_queen() {
-        // Startpos but Black is missing its queen. Material (≈900) dwarfs any PST
-        // wobble, so White to move is up close to a queen and Black to move is
-        // down close to a queen. Range, not exact, so the tables can be retuned.
+        // Startpos but Black is missing its queen. Material dwarfs any PST wobble,
+        // so White to move is up close to a queen. Texel tuning (#42) put the
+        // queen's effective value (material + PST) a bit above its fixed 900, so
+        // the window is wide — the point is "≈ a queen up", not an exact number.
         let fen_w = "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
         let fen_b = "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1";
-        assert!((850..=950).contains(&eval(fen_w)), "got {}", eval(fen_w));
+        assert!((1100..=1300).contains(&eval(fen_w)), "got {}", eval(fen_w));
         assert_eq!(eval(fen_w), -eval(fen_b));
     }
 
@@ -776,20 +785,22 @@ mod tests {
         let b = Board::from_str("4k3/8/8/2ppp3/3P4/8/8/4K3 w - - 0 1").unwrap();
         let s = pawn_structure(&b, Color::White);
         assert_eq!(s, ISOLATED_PAWN);
+        // A penalty (Texel-tuned #42: weak in both phases — harder to defend).
         assert!(s.mg < 0 && s.eg < 0, "isolated pawn must be a penalty, got {s:?}");
     }
 
     #[test]
     fn doubled_pawns_score_worse_than_a_single_pawn() {
-        // a2+a3 (doubled, both isolated, both passed) vs a3 alone (isolated, passed).
-        // The stack must score lower in both phases — the doubled penalty dominates
-        // the extra back-pawn's passed bonus.
+        // a2+a3 (doubled) vs a3 alone, both with a black a7 pawn ahead so *neither*
+        // is passed — that isolates the doubled penalty from the passed-pawn bonus
+        // (which otherwise differs between the two and confounds the comparison).
+        // Both a-pawns are isolated in both positions, so only the doubling differs.
         let doubled = pawn_structure(
-            &Board::from_str("4k3/8/8/8/8/P7/P7/4K3 w - - 0 1").unwrap(),
+            &Board::from_str("k7/p7/8/8/8/P7/P7/K7 w - - 0 1").unwrap(),
             Color::White,
         );
         let single = pawn_structure(
-            &Board::from_str("4k3/8/8/8/8/P7/8/4K3 w - - 0 1").unwrap(),
+            &Board::from_str("k7/p7/8/8/8/8/P7/K7 w - - 0 1").unwrap(),
             Color::White,
         );
         assert!(
