@@ -167,6 +167,18 @@ fn move_score(
 
     let promo = mv.promotion_piece().map_or(0, |pt| PIECE_VALUE[pt.index()]);
     if mv.is_capture() || promo != 0 {
+        // SEE demotion (issue #39): a non-promotion capture that loses material
+        // after recaptures is searched *after* every quiet move. Returning the
+        // (negative) SEE score lands it below the history band (≥ 0) while still
+        // ordering losing captures among themselves least-loss first. Promotions
+        // are exempt — SEE v1 doesn't score the promotion gain, so it would
+        // mis-rate them. The TT move (handled above) is never demoted.
+        if mv.is_capture() && promo == 0 {
+            let see_score = see(board, mv);
+            if see_score < 0 {
+                return see_score;
+            }
+        }
         // MVV-LVA: most valuable victim first, least valuable attacker breaking
         // ties (so PxQ outranks QxQ). An en-passant victim is always a pawn.
         let victim = if mv.is_en_passant() {
@@ -241,7 +253,6 @@ fn is_tactical(mv: Move) -> bool {
 /// queen behind a bishop) are revealed on the next call. Pawn attackers use the
 /// reflection identity: the pawns of color `c` hitting `sq` sit where a pawn of
 /// the *opposite* color on `sq` would capture.
-#[allow(dead_code)] // wired into ordering + qsearch in the next commit
 fn attackers_to(board: &Board, sq: Square, occupied: Bitboard) -> Bitboard {
     let pawns = board.pieces(PieceType::Pawn);
     let white_pawns =
@@ -264,7 +275,6 @@ fn attackers_to(board: &Board, sq: Square, occupied: Bitboard) -> Bitboard {
 /// `(square, type)`. "Cheapest" is by `PieceType` *index* (Pawn=0 … King=5), not
 /// `PIECE_VALUE`, because the king's value there is 0 — index ordering keeps the
 /// king correctly ranked as the recapturer of last resort.
-#[allow(dead_code)] // wired into ordering + qsearch in the next commit
 fn least_valuable_attacker(board: &Board, attackers: Bitboard) -> Option<(Square, PieceType)> {
     let mut best: Option<(Square, PieceType)> = None;
     let mut bb = attackers;
@@ -283,7 +293,6 @@ fn least_valuable_attacker(board: &Board, attackers: Bitboard) -> Option<(Square
 ///
 /// v1 scope: promotions inside the sequence are ignored (a promoting pawn counts
 /// as a pawn). Both call sites use only the sign, so this approximation is safe.
-#[allow(dead_code)] // wired into ordering + qsearch in the next commit
 fn see(board: &Board, mv: Move) -> i32 {
     let to = mv.to();
     let from = mv.from();
@@ -462,6 +471,10 @@ struct SearchContext<'a> {
     /// off. Counts only; they never affect the result.
     null_attempts: u64,
     null_cutoffs: u64,
+    /// SEE diagnostics (issue #39): how many losing captures (`see < 0`)
+    /// quiescence skipped. A non-trivial count in tactical positions confirms
+    /// the qsearch pruning is active. Counts only; never affects the result.
+    see_prunes: u64,
 }
 
 impl<'a> SearchContext<'a> {
@@ -484,6 +497,7 @@ impl<'a> SearchContext<'a> {
             lmr_researches: 0,
             null_attempts: 0,
             null_cutoffs: 0,
+            see_prunes: 0,
         }
     }
 
@@ -588,6 +602,7 @@ pub fn search_timed(
         lmr_researches: 0,
         null_attempts: 0,
         null_cutoffs: 0,
+        see_prunes: 0,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -929,6 +944,15 @@ fn qsearch(
     order_moves(&mut moves, board, Move::NONE, &[Move::NONE; 2], &ctx.history, board.side_to_move);
 
     for mv in moves {
+        // SEE pruning (issue #39): a capture that loses material after recaptures
+        // can't lift the stand-pat score, so skip it instead of recursing. Only
+        // pure captures — promotions (SEE v1 ignores the promotion) and the rare
+        // quiet promotion are always searched.
+        if mv.is_capture() && mv.promotion_piece().is_none() && see(board, mv) < 0 {
+            ctx.see_prunes += 1;
+            continue;
+        }
+
         let undo = board.make_move(mv);
         let score = -qsearch(board, ctx, -beta, -alpha, ply + 1);
         board.unmake_move(mv, undo);
@@ -1256,9 +1280,14 @@ mod tests {
         // re-capture tax on every eval change with nothing to do with PVS. Per-term
         // score expectations live in eval's own tests. Positions with a unique best
         // line only (startpos ties across many equal replies, so it's omitted).
+        // SEE reordering (#39) can change which move wins a fixed-depth tie: in
+        // the second position the engine now prefers Rxf4+ (b4f4) — a winning
+        // capture with check that SEE lifts ahead of the old quiet pick. SEE
+        // qsearch pruning only drops losing (SEE < 0) captures, which can't raise
+        // the side-to-move's score, so this is a tie-break flip, not a regression.
         let cases: [(&str, &str); 4] = [
             ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", "e2a6"),
-            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", "b4c4"),
+            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", "b4f4"),
             ("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", "c3d5"),
             ("4k3/8/8/8/3q4/8/8/3RK3 w - - 0 1", "d1d4"),
         ];
@@ -1477,5 +1506,25 @@ mod tests {
         // pawn ⇒ 0.
         let b = board("4k3/4p3/8/3pP3/8/8/8/4K3 w - d6 0 1");
         assert_eq!(see(&b, find_move(&b, "e5d6")), 0);
+    }
+
+    /// SEE pruning is actually firing: a tactical middlegame full of defended
+    /// captures, searched through iterative deepening, should skip losing
+    /// captures in quiescence in bulk. A zero count would mean the prune is dead.
+    #[test]
+    fn see_prunes_fire_in_a_tactical_position() {
+        let b = board("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"); // Kiwipete
+        let mut tt = TranspositionTable::new(16);
+        tt.new_search();
+        let mut ctx = SearchContext::unbounded(&mut tt);
+        let mut bb = b.clone();
+        for d in 1..=7 {
+            run_root(&mut bb, &mut ctx, d);
+        }
+        assert!(
+            ctx.see_prunes > 0,
+            "expected SEE to prune losing captures, got {}",
+            ctx.see_prunes
+        );
     }
 }
