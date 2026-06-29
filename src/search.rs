@@ -475,6 +475,10 @@ struct SearchContext<'a> {
     /// quiescence skipped. A non-trivial count in tactical positions confirms
     /// the qsearch pruning is active. Counts only; never affects the result.
     see_prunes: u64,
+    /// Check-extension diagnostics (issue #39): how many nodes spent an extra ply
+    /// because the side to move was in check. A non-trivial count confirms the
+    /// extension fires. Counts only; never affects the result.
+    check_extensions: u64,
 }
 
 impl<'a> SearchContext<'a> {
@@ -498,6 +502,7 @@ impl<'a> SearchContext<'a> {
             null_attempts: 0,
             null_cutoffs: 0,
             see_prunes: 0,
+            check_extensions: 0,
         }
     }
 
@@ -603,6 +608,7 @@ pub fn search_timed(
         null_attempts: 0,
         null_cutoffs: 0,
         see_prunes: 0,
+        check_extensions: 0,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -717,6 +723,15 @@ fn negamax(
         return 0; // value ignored: the caller discards aborted iterations.
     }
 
+    // Selective-depth ceiling. Check extensions (below) feed `depth + 1` into the
+    // child, so a perpetual cross-check — both sides forever escaping with check —
+    // never lets `depth` fall to 0. Repetition/fifty-move usually ends such lines,
+    // but not always within the window, so this hard cap on `ply` is the backstop
+    // that bounds recursion (and is the "extension cap" issue #39 calls for).
+    if ply >= MAX_PLY as i32 {
+        return ctx.evaluator.evaluate(board);
+    }
+
     // Repetition is a draw, and is path-dependent (not a property of the position
     // alone), so it must be checked before the TT — a TT entry stored for this
     // key on a non-repeating path would otherwise mask it. A repeated position
@@ -775,11 +790,23 @@ fn negamax(
     let side = board.side_to_move;
     let ply_idx = (ply as usize).min(MAX_PLY - 1);
 
-    // Whether the side to move is in check — null-move pruning (#36) and late-move
-    // reductions (#37) are both suppressed in check (the node is tactical). Only
-    // computed at `depth >= 3`, the only depths either can fire, so shallow nodes
-    // skip the attack scan.
-    let in_check_node = depth >= 3 && in_check(board, side);
+    // Whether the side to move is in check. Null-move pruning (#36) and late-move
+    // reductions (#37) are both suppressed in check (the node is tactical) and
+    // both keep their own `depth >= 3` gate, so this scan changes neither. It is
+    // now computed unconditionally because the check extension (#39) needs it at
+    // *every* depth — extending is most valuable at the frontier, where it stops
+    // a forcing line from being cut into the (stand-pat) quiescence search.
+    let in_check_node = in_check(board, side);
+
+    // Check extension (issue #39): spend one extra ply when in check so the
+    // opponent's reply is searched at full strength. In check, LMR is off (its
+    // `!in_check_node` gate), so `ext` and any reduction `r` are never both set —
+    // `child_depth - r` therefore can't underflow.
+    let ext = if in_check_node { 1 } else { 0 };
+    if ext == 1 {
+        ctx.check_extensions += 1;
+    }
+    let child_depth = depth - 1 + ext;
 
     // ── Null-move pruning (issue #36) ────────────────────────────────────────
     // Hand the opponent a *free* move (a null move); if a shallower search of the
@@ -820,7 +847,7 @@ fn negamax(
         let score = if i == 0 {
             // The first (best-ordered) move is the PV candidate: search it with
             // the full window so its exact score sets alpha for the scouts below.
-            -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1, true)
+            -negamax(board, ctx, child_depth, -beta, -alpha, ply + 1, true)
         } else {
             // PVS scout (issue #34): a null window (alpha, alpha+1) only asks "is
             // this move worse than the PV?". A fail-low costs far less than a full
@@ -848,22 +875,22 @@ fn negamax(
 
             let mut s = if r > 0 {
                 ctx.lmr_reductions += 1;
-                -negamax(board, ctx, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true)
+                -negamax(board, ctx, child_depth - r, -alpha - 1, -alpha, ply + 1, true)
             } else {
-                -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1, true)
+                -negamax(board, ctx, child_depth, -alpha - 1, -alpha, ply + 1, true)
             };
             // A reduced scout that beats alpha may have been over-reduced — verify
             // at full depth (still the null window) before trusting it.
             if !ctx.aborted && r > 0 && s > alpha {
                 ctx.lmr_researches += 1;
-                s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1, true);
+                s = -negamax(board, ctx, child_depth, -alpha - 1, -alpha, ply + 1, true);
             }
             // PVS: a full-depth null-window scout that beats alpha inside a *wide*
             // window (`s < beta`, else the scout already is the full window) may be
             // a new PV — re-search it full-width for its true score.
             if !ctx.aborted && s > alpha && s < beta {
                 ctx.pvs_researches += 1;
-                -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1, true)
+                -negamax(board, ctx, child_depth, -beta, -alpha, ply + 1, true)
             } else {
                 s
             }
@@ -1526,5 +1553,34 @@ mod tests {
             "expected SEE to prune losing captures, got {}",
             ctx.see_prunes
         );
+    }
+
+    /// Check extensions actually fire: a sharp position whose best line is a
+    /// series of checks should spend extra plies in bulk. A zero count would mean
+    /// the extension is wired but never triggers.
+    #[test]
+    fn check_extensions_fire_in_a_forcing_position() {
+        let b = board("2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1"); // mate in 2
+        let mut tt = TranspositionTable::new(16);
+        tt.new_search();
+        let mut ctx = SearchContext::unbounded(&mut tt);
+        let mut bb = b.clone();
+        for d in 1..=6 {
+            run_root(&mut bb, &mut ctx, d);
+        }
+        assert!(
+            ctx.check_extensions > 0,
+            "expected check extensions to fire, got {}",
+            ctx.check_extensions
+        );
+    }
+
+    /// Check extensions must never *lose* a tactic the engine already found —
+    /// they only ever search deeper. This forced mate-in-2 stays found.
+    #[test]
+    fn check_extensions_still_find_a_forced_mate() {
+        let b = board("2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1");
+        let r = search(&b, 5);
+        assert!(r.score >= MATE_BOUND, "expected a forced mate, got score {}", r.score);
     }
 }
