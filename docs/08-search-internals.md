@@ -4,7 +4,7 @@ Phase 2 turns the Phase 1 toy searcher into a *real* engine: a position identity
 it can cache and compare (Zobrist), a transposition table, principled move
 ordering, quiescence at the leaves, and draw detection. This is the running
 deep-dive for that work — one section lands per issue (#23–#28), now continuing
-into Phase 3's selective search (§6, PVS, #34). It assumes the
+into Phase 3's selective search (§6 PVS #34, §7 LMR #37). It assumes the
 board and move machinery from [05-board-representation.md](05-board-representation.md)
 and [06-move-generation.md](06-move-generation.md), and the Phase 1 negamax in
 `src/search.rs`.
@@ -397,3 +397,70 @@ depth the raw node count is mixed (the scout/TT interaction, and on quiet
 weakly-ordered positions extra re-searches) — the real gate is the SPRT vs v0.5.0.
 Its larger payoff is structural: LMR and NMP now have the reduce-then-re-search
 machinery they need.
+
+---
+
+## 7. Late move reductions — searching late moves shallower (`src/search.rs`, issue #37)
+
+PVS proved nearly Elo-neutral alone — it only narrows windows. **LMR is what cashes
+the scaffolding in.** The bet: with good ordering, a move sitting late in the list
+is unlikely to be best, so don't spend full depth proving it — search it *shallower*
+and only pay full depth if it surprises us.
+
+### The three-tier search
+
+LMR slots into the PVS scout arm of `negamax`. For a late, eligible move:
+
+```text
+1. reduced scout:   s = -negamax(depth-1-r, -alpha-1, -alpha)   // shallow null window
+2. if s > alpha:    s = -negamax(depth-1,   -alpha-1, -alpha)   // full depth, null window
+3. if alpha<s<beta: s = -negamax(depth-1,   -beta,    -alpha)   // full depth, full window (PVS)
+```
+
+Tier 1 is the saving — most late moves fail low even shallow, and we believe them.
+Tier 2 is the safety net: a reduced scout that beats alpha might just be
+*under-searched*, so we re-verify at full depth before trusting it. Tier 3 is the
+ordinary PVS re-search for a genuine new PV. When the reduction `r == 0` (every
+non-eligible move) tiers 1–2 collapse to the plain PVS scout — LMR touches **only**
+eligible late quiets.
+
+### Who gets reduced
+
+Reduce move `i` only if it's genuinely unlikely-and-quiet: `depth >= 3`, `i >= 3`,
+not a capture/promotion (`!is_tactical`), the node isn't in check, the move isn't a
+killer, and the move doesn't give check. The forcing moves — captures, checks,
+killers, the TT/PV move (ordered first, so `i == 0`) — keep full depth, which is
+what stops LMR from walking past a tactic: a mating move is a check, so it is never
+reduced.
+
+The `gives_check` test is a full `in_check` scan (not incremental), so it sits last
+in the `&&` chain and runs only after the cheap tests pass; the node-in-check scan
+is gated on `depth >= 3` so shallow nodes skip it entirely.
+
+### How much
+
+One table, `R(depth, i) = floor(0.75 + ln(depth)·ln(i)/2)` — reductions grow with
+depth and with how late the move is — clamped so the reduced depth stays `>= 1`.
+Keeping it in a single function makes the formula SPRT-tunable without touching the
+search. The table is built once at **startup** (`search::init`), never lazily on a
+search's clock — the lesson from the magic-table init bug (a one-time build billed
+to the first move truncates it at a short TC).
+
+### Why no invariance test
+
+Unlike PVS, LMR **deliberately** changes the fixed-depth result — it prunes lines a
+full search would visit. So there's nothing to assert byte-equal. Correctness is
+behavioural instead: a tactical suite (forced mates + a decisively winning position,
+each captured from the *pre-LMR* engine at the depth it already solved them) asserts
+LMR still finds the win, and a counter test (`lmr_reductions` / `lmr_researches`)
+asserts reductions fire in bulk with a bounded re-search rate — a high rate would
+mean we're over-reducing.
+
+### What it buys
+
+The big one: **~2 plies deeper in the same time** (warm depth-in-time vs v0.5.0:
+5.5→7.1 at 100 ms, 6.3→8.2 at 200 ms, 7.1→9.3 at 500 ms). This is the structural
+payoff PVS was laying groundwork for, and the combined PVS+LMR SPRT vs v0.5.0 is the
+acceptance gate for both. Later refinements — SEE-gated reductions (#39),
+history-scaled reductions (#25) — reduce more for moves that look bad and less for
+moves that look good; they're deferred to keep this first signal clean.
