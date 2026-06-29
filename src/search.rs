@@ -55,7 +55,7 @@ use crate::movegen::{generate_legal, in_check};
 use crate::moves::Move;
 use crate::timeman::Budget;
 use crate::tt::{Bound, TranspositionTable};
-use crate::types::Color;
+use crate::types::{Color, PieceType};
 
 /// A score larger than any real evaluation — used as the initial alpha/beta
 /// bounds (an open window). Must exceed every score the tree can produce,
@@ -221,6 +221,21 @@ fn is_tactical(mv: Move) -> bool {
     mv.is_capture() || mv.promotion_piece().is_some()
 }
 
+/// Whether `side` has any non-pawn, non-king material (a knight, bishop, rook, or
+/// queen). This is the zugzwang guard for null-move pruning (#36): in king-and-pawn
+/// endings passing can be *better* than any legal move, so a null move there would
+/// prune lines that are actually losing. With a real piece on the board that
+/// pathology is vanishingly rare, so NMP is only attempted when this holds.
+fn has_non_pawn_material(board: &Board, side: Color) -> bool {
+    let ours = board.color(side);
+    let non_pawn = board
+        .pieces(PieceType::Knight)
+        .union(board.pieces(PieceType::Bishop))
+        .union(board.pieces(PieceType::Rook))
+        .union(board.pieces(PieceType::Queen));
+    !non_pawn.intersect(ours).is_empty()
+}
+
 /// Late-move-reduction table (issue #37): plies to shave off a late, quiet move's
 /// search, indexed `[depth][move_index]` (both clamped to 63). Reductions grow
 /// with depth and with how late the move is — `R = floor(0.75 + ln(d)·ln(i)/2)`.
@@ -310,6 +325,12 @@ struct SearchContext<'a> {
     /// safe (rarely wrong); a high one means we're over-reducing. Counts only.
     lmr_reductions: u64,
     lmr_researches: u64,
+    /// NMP diagnostics (issue #36): how many nodes attempted a null move, and how
+    /// many of those failed high (`>= beta`) and pruned the node. A high
+    /// `cutoffs / attempts` ratio is the signal that null-move pruning is paying
+    /// off. Counts only; they never affect the result.
+    null_attempts: u64,
+    null_cutoffs: u64,
 }
 
 impl<'a> SearchContext<'a> {
@@ -330,6 +351,8 @@ impl<'a> SearchContext<'a> {
             pvs_researches: 0,
             lmr_reductions: 0,
             lmr_researches: 0,
+            null_attempts: 0,
+            null_cutoffs: 0,
         }
     }
 
@@ -413,6 +436,8 @@ pub fn search_timed(
         pvs_researches: 0,
         lmr_reductions: 0,
         lmr_researches: 0,
+        null_attempts: 0,
+        null_cutoffs: 0,
     };
 
     let mut best = SearchResult { best_move: Move::NONE, score: 0, depth: 0, nodes: 0 };
@@ -474,16 +499,16 @@ fn run_root(board: &mut Board, ctx: &mut SearchContext<'_>, depth: u32) -> Searc
         let score = if best_move == Move::NONE {
             // First (best-ordered) move: a full-window search establishes the PV
             // baseline. (-INF, -alpha) is the original root window.
-            -negamax(board, ctx, depth - 1, -INF, -alpha, 1)
+            -negamax(board, ctx, depth - 1, -INF, -alpha, 1, true)
         } else {
             // PVS scout: prove later moves worse than the PV with a null window.
             // The root takes no beta cutoff (its beta is +INF), so any fail-high
             // is a genuine new best — re-search it full-width for an exact score.
             ctx.pvs_scouts += 1;
-            let s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, 1);
+            let s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, 1, true);
             if !ctx.aborted && s > alpha {
                 ctx.pvs_researches += 1;
-                -negamax(board, ctx, depth - 1, -INF, -alpha, 1)
+                -negamax(board, ctx, depth - 1, -INF, -alpha, 1, true)
             } else {
                 s
             }
@@ -520,6 +545,7 @@ fn negamax(
     mut alpha: i32,
     beta: i32,
     ply: i32,
+    null_ok: bool,
 ) -> i32 {
     ctx.nodes += 1;
     if ctx.should_stop() {
@@ -583,12 +609,44 @@ fn negamax(
 
     let side = board.side_to_move;
     let ply_idx = (ply as usize).min(MAX_PLY - 1);
-    order_moves(&mut moves, board, tt_move, &ctx.killers[ply_idx], &ctx.history, side);
 
-    // Whether the side to move is in check — late-move reductions (#37) are
-    // suppressed in check (the node is tactical). Only computed at `depth >= 3`,
-    // the only depths LMR can fire, so shallow nodes skip the attack scan.
+    // Whether the side to move is in check — null-move pruning (#36) and late-move
+    // reductions (#37) are both suppressed in check (the node is tactical). Only
+    // computed at `depth >= 3`, the only depths either can fire, so shallow nodes
+    // skip the attack scan.
     let in_check_node = depth >= 3 && in_check(board, side);
+
+    // ── Null-move pruning (issue #36) ────────────────────────────────────────
+    // Hand the opponent a *free* move (a null move); if a shallower search of the
+    // resulting position still fails high, the real moves would too — so prune the
+    // node without searching them. Gated against the known failure modes: never in
+    // check, never when `beta` is a mate bound (we return `beta`, so a mate score
+    // can't be fabricated), never in king-and-pawn endings where passing can beat
+    // every legal move (zugzwang — the `has_non_pawn_material` guard), and never
+    // twice in a row (`null_ok`, false only in the null child below). The
+    // `eval >= beta` gate restricts pruning to nodes that already look winning.
+    if null_ok
+        && depth >= 3
+        && !in_check_node
+        && beta < MATE_BOUND
+        && has_non_pawn_material(board, side)
+        && ctx.evaluator.evaluate(board) >= beta
+    {
+        ctx.null_attempts += 1;
+        let r = if depth >= 6 { 3 } else { 2 };
+        let reduced = depth.saturating_sub(1 + r);
+        ctx.rep.push(board.hash); // the pre-null position becomes an ancestor
+        let undo = board.make_null_move();
+        let null_score = -negamax(board, ctx, reduced, -beta, -beta + 1, ply + 1, false);
+        board.unmake_null_move(undo);
+        ctx.rep.pop();
+        if !ctx.aborted && null_score >= beta {
+            ctx.null_cutoffs += 1;
+            return beta; // fail-hard cutoff; `beta < MATE_BOUND` keeps it honest
+        }
+    }
+
+    order_moves(&mut moves, board, tt_move, &ctx.killers[ply_idx], &ctx.history, side);
 
     let mut best_move = Move::NONE;
     for (i, mv) in moves.into_iter().enumerate() {
@@ -597,7 +655,7 @@ fn negamax(
         let score = if i == 0 {
             // The first (best-ordered) move is the PV candidate: search it with
             // the full window so its exact score sets alpha for the scouts below.
-            -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1)
+            -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1, true)
         } else {
             // PVS scout (issue #34): a null window (alpha, alpha+1) only asks "is
             // this move worse than the PV?". A fail-low costs far less than a full
@@ -625,22 +683,22 @@ fn negamax(
 
             let mut s = if r > 0 {
                 ctx.lmr_reductions += 1;
-                -negamax(board, ctx, depth - 1 - r, -alpha - 1, -alpha, ply + 1)
+                -negamax(board, ctx, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true)
             } else {
-                -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1)
+                -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1, true)
             };
             // A reduced scout that beats alpha may have been over-reduced — verify
             // at full depth (still the null window) before trusting it.
             if !ctx.aborted && r > 0 && s > alpha {
                 ctx.lmr_researches += 1;
-                s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1);
+                s = -negamax(board, ctx, depth - 1, -alpha - 1, -alpha, ply + 1, true);
             }
             // PVS: a full-depth null-window scout that beats alpha inside a *wide*
             // window (`s < beta`, else the scout already is the full window) may be
             // a new PV — re-search it full-width for its true score.
             if !ctx.aborted && s > alpha && s < beta {
                 ctx.pvs_researches += 1;
-                -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1)
+                -negamax(board, ctx, depth - 1, -beta, -alpha, ply + 1, true)
             } else {
                 s
             }
@@ -1115,6 +1173,70 @@ mod tests {
             "LMR re-search rate too high (over-reducing): {} researches / {} reductions",
             ctx.lmr_researches,
             ctx.lmr_reductions
+        );
+    }
+
+    // ── Null-move pruning (issue #36) ───────────────────────────────────────
+
+    /// NMP must not drop a tactic the engine could previously find. Same fixtures
+    /// (and depth) as [`lmr_keeps_finding_known_tactics`]: NMP is engaged at this
+    /// depth, so a decisive score surviving proves the prune isn't cutting real
+    /// lines. Asserting the score (not an exact move) is robust to NMP's
+    /// legitimate non-invariance.
+    #[test]
+    fn nmp_keeps_finding_known_tactics() {
+        // (fen, depth, minimum acceptable score)
+        let cases: [(&str, u32, i32); 4] = [
+            ("2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1", 7, MATE_BOUND), // mate 2
+            ("r2qrb2/p1pn1Qp1/1p4Nk/4PR2/3n4/7N/P5PP/R6K w - - 0 1", 7, MATE_BOUND),        // mate 2
+            ("1k1r4/pp1b1R2/3q2pp/4p3/2B5/4Q3/PPP2B2/2K5 b - - 0 1", 7, MATE_BOUND),         // mate 3
+            ("2r1nrk1/p4p1p/1p2p1pQ/nP6/2pNP3/P1B2q1P/2B2P2/R4RK1 w - - 0 1", 7, 800),       // +1150
+        ];
+        for (fen, depth, min_score) in cases {
+            let r = search(&board(fen), depth);
+            assert!(
+                r.score >= min_score,
+                "NMP dropped a tactic in {fen}: score {} < {min_score}",
+                r.score
+            );
+        }
+    }
+
+    /// NMP is actually firing and pruning: on a normal middlegame searched through
+    /// iterative deepening (so the TT seeds ordering and eval often clears beta),
+    /// null moves are attempted in bulk and a healthy fraction fail high and prune.
+    #[test]
+    fn nmp_attempts_and_cuts() {
+        let b = board("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10");
+        let mut tt = TranspositionTable::new(16);
+        tt.new_search();
+        let mut ctx = SearchContext::unbounded(&mut tt);
+        let mut bb = b.clone();
+        for d in 1..=8 {
+            run_root(&mut bb, &mut ctx, d);
+        }
+        assert!(ctx.null_attempts > 100, "expected many null attempts, got {}", ctx.null_attempts);
+        assert!(ctx.null_cutoffs > 0, "expected some null cutoffs, got {}", ctx.null_cutoffs);
+    }
+
+    /// Zugzwang guard: in a king-and-pawn ending neither side has non-pawn
+    /// material, so NMP must never fire (passing can beat every legal move there).
+    /// A pure pawn endgame searched deep should record *zero* null attempts —
+    /// a direct check that the `has_non_pawn_material` guard holds.
+    #[test]
+    fn nmp_is_disabled_without_non_pawn_material() {
+        let b = board("8/8/8/4k3/8/4K3/4P3/8 w - - 0 1"); // K+P vs K
+        let mut tt = TranspositionTable::new(16);
+        tt.new_search();
+        let mut ctx = SearchContext::unbounded(&mut tt);
+        let mut bb = b.clone();
+        for d in 1..=8 {
+            run_root(&mut bb, &mut ctx, d);
+        }
+        assert_eq!(
+            ctx.null_attempts, 0,
+            "NMP fired in a pawn-only endgame ({} attempts) — zugzwang guard failed",
+            ctx.null_attempts
         );
     }
 }

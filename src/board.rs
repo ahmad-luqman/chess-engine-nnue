@@ -316,6 +316,47 @@ impl Board {
         self.hash = undo.hash;
     }
 
+    /// Make a **null move**: hand the turn to the opponent without moving a piece.
+    /// Used by null-move pruning in the search — if even passing leaves us winning,
+    /// the position is too good to bother searching the real moves.
+    ///
+    /// Only two board features change: the side to move flips, and the en-passant
+    /// square is cleared (a pass can never be answered by an en-passant capture of
+    /// a pawn that just double-pushed, because no pawn just double-pushed). Both
+    /// are mirrored into the incrementally-maintained Zobrist key exactly as
+    /// [`make_move`](Self::make_move) does, so the key stays consistent. Pairs with
+    /// [`unmake_null_move`](Self::unmake_null_move).
+    pub fn make_null_move(&mut self) -> Undo {
+        let prev = Undo {
+            captured: None,
+            castling: self.castling,
+            ep_square: self.ep_square,
+            halfmove_clock: self.halfmove_clock,
+            hash: self.hash, // pre-move snapshot; unmake restores it verbatim
+        };
+
+        let mut hash = self.hash;
+        hash ^= self.ep_zobrist(); // drop the old ep contribution (reads current ep/stm)
+        self.ep_square = None;
+        self.side_to_move = self.side_to_move.flip();
+        hash ^= zobrist::KEYS.side;
+        hash ^= self.ep_zobrist(); // add the new ep contribution (now 0)
+        self.hash = hash;
+        // Like make_move, the incremental key must equal a from-scratch recompute.
+        debug_assert_eq!(self.hash, zobrist::compute(self), "incremental hash drifted (null)");
+
+        prev
+    }
+
+    /// Reverse a [`make_null_move`](Self::make_null_move). Castling rights and the
+    /// halfmove clock are untouched by a null move, so only the side, ep square,
+    /// and key need restoring.
+    pub fn unmake_null_move(&mut self, undo: Undo) {
+        self.side_to_move = self.side_to_move.flip();
+        self.ep_square = undo.ep_square;
+        self.hash = undo.hash;
+    }
+
     /// The Zobrist contribution of the en-passant square, which is **nonzero
     /// only when the side to move can actually capture en passant** — i.e. a
     /// pawn of theirs sits on a square attacking `ep_square`.
@@ -484,6 +525,44 @@ mod tests {
         }
         for fen in [STARTPOS, KIWIPETE, POS3, POS4, POS5, EP_POS] {
             walk(&mut board(fen), 3);
+        }
+    }
+
+    // ── Null move (issue #36) ───────────────────────────────────────────────
+
+    #[test]
+    fn null_move_hash_matches_a_fresh_parse() {
+        // The forward-hash validator. A round-trip alone can't catch a bug in
+        // `make_null_move`'s key math, because `unmake_null_move` restores the
+        // pre-move snapshot verbatim — so we compare the *made* key against a
+        // board parsed directly into the post-null position (opponent to move, ep
+        // cleared). Equal keys prove the remove-old-ep / flip-side / add-new-ep
+        // ordering is right.
+
+        // No ep: only the side flips.
+        let mut b = board(STARTPOS);
+        b.make_null_move();
+        assert_eq!(b.hash, board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1").hash);
+
+        // Live ep: EP_POS's d6 is capturable by White's e5 pawn, so its ep key is
+        // nonzero — a null move must XOR it back out. (A non-capturable ep would
+        // hash to 0 and make this assertion vacuous.)
+        assert_ne!(board(EP_POS).ep_zobrist(), 0, "EP_POS must have a live ep key");
+        let mut b = board(EP_POS);
+        b.make_null_move();
+        assert_eq!(b.hash, board("4k3/8/8/3pP3/8/8/8/4K3 b - - 0 1").hash);
+    }
+
+    #[test]
+    fn null_move_roundtrips() {
+        // make then unmake restores the board bit-for-bit (Board derives Eq),
+        // including the live-ep case where ep state must come back.
+        for fen in [STARTPOS, KIWIPETE, POS4, EP_POS] {
+            let original = board(fen);
+            let mut b = original.clone();
+            let undo = b.make_null_move();
+            b.unmake_null_move(undo);
+            assert_eq!(b, original, "null move did not round-trip for {fen}");
         }
     }
 }
