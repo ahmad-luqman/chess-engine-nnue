@@ -42,8 +42,16 @@ jobs:
 
       # Correctness: unit tests + the perft gate + the incremental-hash
       # debug_assert all run here (the latter two live inside `cargo test`).
+      # On the AVX2-capable GitHub runner this is where the NNUE AVX2 kernels are
+      # bit-verified against the scalar reference (issue #47) — that path cannot run
+      # on the aarch64 dev host, so CI is its proving ground.
       - name: Test
         run: cargo test
+
+      # Scalar fallback (issue #47): with the `simd` feature off, the NNUE hot paths
+      # must stay bit-identical and correct. Guards the portable path from rotting.
+      - name: Test (scalar fallback, no SIMD)
+        run: cargo test --no-default-features
 
       # Prove the fat-LTO release profile (the binary that actually matters) still
       # compiles — debug compiling is not enough for an engine.

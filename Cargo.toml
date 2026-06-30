@@ -12,6 +12,13 @@ path = "src/main.rs"
 name = "engine"
 path = "src/lib.rs"
 
+# Hand-written `core::arch` SIMD for the NNUE hot paths (#47). On by default;
+# `--no-default-features` forces the bit-identical scalar fallback (the same path
+# any non-AVX2 x86 / non-aarch64 target takes at runtime). Pure cfg gate — no deps.
+[features]
+default = ["simd"]
+simd = []
+
 [dev-dependencies]
 # Statistics-driven micro-benchmarks (issue #30). Local-only, not run in CI;
 # criterion builds optimized, so benches always measure release-grade code.

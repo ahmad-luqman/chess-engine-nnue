@@ -1,0 +1,19 @@
+# Cargo configuration — NNUE SIMD build story (#47, ADR 0018).
+#
+# The default build is intentionally PORTABLE: the NNUE hot paths detect AVX2 at
+# runtime (x86-64) and use NEON unconditionally (aarch64 baseline), with a
+# bit-identical scalar fallback. So nothing here is active by default — a global
+# `target-cpu` would apply to CI and every consumer and break portability.
+#
+# To squeeze the most out of *your own* machine (lets the compiler use AVX2/AVX-512
+# in the autovectorized scalar code too, not just the hand-written kernels), build
+# with target-cpu=native via the env var — no file edit, no committed default:
+#
+#     RUSTFLAGS="-C target-cpu=native" cargo build --release
+#
+# Or uncomment the block below to make it the default for *local* builds in this
+# checkout only (do NOT commit it uncommented — it would pin the CI/release build
+# to whatever host built it):
+#
+# [build]
+# rustflags = ["-C", "target-cpu=native"]

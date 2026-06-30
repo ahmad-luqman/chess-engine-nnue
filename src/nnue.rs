@@ -177,9 +177,7 @@ impl Accumulator {
     pub fn add(&mut self, piece: Piece, sq: Square, net: &Network) {
         for perspective in 0..2 {
             let col = &net.feature_weights[feature_index(perspective, piece, sq)];
-            for (a, &w) in self.vals[perspective].iter_mut().zip(col) {
-                *a += w;
-            }
+            acc_add(&mut self.vals[perspective], col);
         }
     }
 
@@ -188,9 +186,7 @@ impl Accumulator {
     pub fn remove(&mut self, piece: Piece, sq: Square, net: &Network) {
         for perspective in 0..2 {
             let col = &net.feature_weights[feature_index(perspective, piece, sq)];
-            for (a, &w) in self.vals[perspective].iter_mut().zip(col) {
-                *a -= w;
-            }
+            acc_sub(&mut self.vals[perspective], col);
         }
     }
 
@@ -229,6 +225,63 @@ pub fn evaluate_accumulator(acc: &Accumulator, stm: Color, piece_count: u32) -> 
     let bucket = output_bucket(piece_count);
     let weights = &net.output_weights[bucket];
 
+    // The hot reduction `Σ screlu(acc)·w` (SIMD-accelerated when available); the
+    // truncating dequant below stays scalar because its step order is load-bearing.
+    let mut out = forward(us, them, weights);
+
+    out /= QA;
+    out += i32::from(net.output_bias[bucket]);
+    out *= SCALE;
+    out /= QA * QB;
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIMD hot paths (#47)
+//
+// Three implementations of each of the two NNUE hot loops — accumulator
+// column add/sub and the `Σ screlu·w` output reduction:
+//
+//   * `*_scalar` — the always-compiled reference. Bit-exact, portable, and the
+//     oracle the `simd_matches_scalar_over_perft_walk` test compares against.
+//   * `simd::*_avx2` — x86-64, selected at runtime via `is_x86_feature_detected!`.
+//   * `simd::*_neon` — aarch64, where NEON is baseline (no runtime check needed).
+//
+// The `acc_add`/`acc_sub`/`forward` dispatchers pick a kernel at the cfg/runtime
+// level so the rest of the module is SIMD-agnostic. All three kernels are
+// bit-identical: the accumulator ops are plain `i16` lane add/sub, and the
+// forward reduction differs only in the *order* it sums the 512 `screlu·w` terms,
+// which is associative in `i32` (no lane overflows — the whole sum already fits).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Scalar reference: add a feature column into one perspective's accumulator.
+///
+/// Never feature-gated out — it is the portable fallback *and* the bit-identity
+/// oracle for the SIMD kernels, so it can be unused in a SIMD-only library build.
+#[inline]
+#[allow(dead_code)]
+fn acc_add_scalar(acc: &mut [i16; HL], col: &[i16; HL]) {
+    for (a, &w) in acc.iter_mut().zip(col) {
+        *a += w;
+    }
+}
+
+/// Scalar reference: subtract a feature column from one perspective's accumulator.
+#[inline]
+#[allow(dead_code)]
+fn acc_sub_scalar(acc: &mut [i16; HL], col: &[i16; HL]) {
+    for (a, &w) in acc.iter_mut().zip(col) {
+        *a -= w;
+    }
+}
+
+/// Scalar reference for the output reduction `Σ screlu(acc)·w` (in `QA²·QB`).
+///
+/// The `us` half multiplies `weights[0..HL]`, the `them` half `weights[HL..2HL]`;
+/// the running sum stays `i32` (a single `screlu·w` term can approach `i32::MAX`).
+#[inline]
+#[allow(dead_code)]
+fn forward_scalar(us: &[i16; HL], them: &[i16; HL], weights: &[i16; 2 * HL]) -> i32 {
     let mut out: i32 = 0;
     for (i, &a) in us.iter().enumerate() {
         out += screlu(a) * i32::from(weights[i]);
@@ -236,12 +289,252 @@ pub fn evaluate_accumulator(acc: &Accumulator, stm: Color, piece_count: u32) -> 
     for (i, &a) in them.iter().enumerate() {
         out += screlu(a) * i32::from(weights[HL + i]);
     }
-
-    out /= QA;
-    out += i32::from(net.output_bias[bucket]);
-    out *= SCALE;
-    out /= QA * QB;
     out
+}
+
+/// Add a feature column into one perspective's accumulator (SIMD when available).
+#[inline]
+fn acc_add(acc: &mut [i16; HL], col: &[i16; HL]) {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: the runtime check above confirms AVX2 is present.
+            return unsafe { simd::acc_add_avx2(acc, col) };
+        }
+        return acc_add_scalar(acc, col);
+    }
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    // SAFETY: NEON is part of the aarch64 baseline, so it is always available.
+    return unsafe { simd::acc_add_neon(acc, col) };
+    #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    acc_add_scalar(acc, col)
+}
+
+/// Subtract a feature column from one perspective's accumulator (SIMD when available).
+#[inline]
+fn acc_sub(acc: &mut [i16; HL], col: &[i16; HL]) {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: the runtime check above confirms AVX2 is present.
+            return unsafe { simd::acc_sub_avx2(acc, col) };
+        }
+        return acc_sub_scalar(acc, col);
+    }
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    // SAFETY: NEON is part of the aarch64 baseline, so it is always available.
+    return unsafe { simd::acc_sub_neon(acc, col) };
+    #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    acc_sub_scalar(acc, col)
+}
+
+/// The output reduction `Σ screlu(acc)·w` (SIMD when available).
+#[inline]
+fn forward(us: &[i16; HL], them: &[i16; HL], weights: &[i16; 2 * HL]) -> i32 {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: the runtime check above confirms AVX2 is present.
+            return unsafe { simd::forward_avx2(us, them, weights) };
+        }
+        return forward_scalar(us, them, weights);
+    }
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    // SAFETY: NEON is part of the aarch64 baseline, so it is always available.
+    return unsafe { simd::forward_neon(us, them, weights) };
+    #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    forward_scalar(us, them, weights)
+}
+
+/// Hand-written SIMD kernels. Every `unsafe fn` here is bit-identical to its
+/// `*_scalar` counterpart; `unsafe` is confined to the intrinsics, and the safety
+/// contract is the same for all of them (documented per fn).
+#[cfg(feature = "simd")]
+mod simd {
+    use super::{HL, QA};
+
+    /// AVX2 accumulator add: 16 `i16` lanes per 256-bit vector, `HL` divisible by 16.
+    ///
+    /// # Safety
+    /// Caller must ensure the AVX2 target feature is available (checked at runtime
+    /// in [`super::acc_add`]). The fixed-size array args make the unaligned loads
+    /// and `HL`-strided indexing in-bounds.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn acc_add_avx2(acc: &mut [i16; HL], col: &[i16; HL]) {
+        use core::arch::x86_64::*;
+        let mut i = 0;
+        while i < HL {
+            let a = _mm256_loadu_si256(acc.as_ptr().add(i) as *const __m256i);
+            let w = _mm256_loadu_si256(col.as_ptr().add(i) as *const __m256i);
+            _mm256_storeu_si256(acc.as_mut_ptr().add(i) as *mut __m256i, _mm256_add_epi16(a, w));
+            i += 16;
+        }
+    }
+
+    /// AVX2 accumulator subtract. See [`acc_add_avx2`] for the safety contract.
+    ///
+    /// # Safety
+    /// Same as [`acc_add_avx2`]: AVX2 must be available.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn acc_sub_avx2(acc: &mut [i16; HL], col: &[i16; HL]) {
+        use core::arch::x86_64::*;
+        let mut i = 0;
+        while i < HL {
+            let a = _mm256_loadu_si256(acc.as_ptr().add(i) as *const __m256i);
+            let w = _mm256_loadu_si256(col.as_ptr().add(i) as *const __m256i);
+            _mm256_storeu_si256(acc.as_mut_ptr().add(i) as *mut __m256i, _mm256_sub_epi16(a, w));
+            i += 16;
+        }
+    }
+
+    /// AVX2 output reduction. Each lane group widens 8 `i16` → `i32` (`cvtepi16_epi32`),
+    /// clamps to `[0, QA]`, squares, multiplies by the weight, and accumulates. Two
+    /// independent accumulators (16 `i16` per iteration) hide the `mullo` latency; both
+    /// are summed, then the eight `i32` lanes are horizontally reduced. Bit-identical to
+    /// the scalar reduction (associative `i32`, no lane overflow).
+    ///
+    /// # Safety
+    /// AVX2 must be available (checked in [`super::forward`]).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn forward_avx2(us: &[i16; HL], them: &[i16; HL], weights: &[i16; 2 * HL]) -> i32 {
+        use core::arch::x86_64::*;
+
+        // One lane group: widen 8 i16 → i32, clamp [0, QA], square, ×weight, accumulate.
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn lane(acc: __m256i, vals: *const i16, wts: *const i16, qa: __m256i) -> __m256i {
+            let zero = _mm256_setzero_si256();
+            let a = _mm256_cvtepi16_epi32(_mm_loadu_si128(vals as *const __m128i));
+            let c = _mm256_min_epi32(_mm256_max_epi32(a, zero), qa); // clamp [0, QA]
+            let sq = _mm256_mullo_epi32(c, c); // screlu
+            let w = _mm256_cvtepi16_epi32(_mm_loadu_si128(wts as *const __m128i));
+            _mm256_add_epi32(acc, _mm256_mullo_epi32(sq, w))
+        }
+
+        // Two independent accumulators (16 i16 per iteration) to hide mul latency.
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn dot(
+            a0: __m256i,
+            a1: __m256i,
+            vals: *const i16,
+            wts: *const i16,
+        ) -> (__m256i, __m256i) {
+            let qa = _mm256_set1_epi32(QA);
+            let (mut a0, mut a1) = (a0, a1);
+            let mut i = 0;
+            while i < HL {
+                a0 = lane(a0, vals.add(i), wts.add(i), qa);
+                a1 = lane(a1, vals.add(i + 8), wts.add(i + 8), qa);
+                i += 16;
+            }
+            (a0, a1)
+        }
+
+        let z = _mm256_setzero_si256();
+        let (a0, a1) = dot(z, z, us.as_ptr(), weights.as_ptr());
+        let (a0, a1) = dot(a0, a1, them.as_ptr(), weights.as_ptr().add(HL));
+        let acc = _mm256_add_epi32(a0, a1);
+
+        // Horizontal sum of the eight i32 lanes.
+        let lo = _mm256_castsi256_si128(acc);
+        let hi = _mm256_extracti128_si256(acc, 1);
+        let s = _mm_add_epi32(lo, hi);
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b00_00_00_01));
+        _mm_cvtsi128_si32(s)
+    }
+
+    /// NEON accumulator add: 8 `i16` lanes per 128-bit vector, `HL` divisible by 8.
+    ///
+    /// # Safety
+    /// NEON is part of the aarch64 baseline, so this is always callable on aarch64.
+    /// The fixed-size array args keep the loads/stores in-bounds.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn acc_add_neon(acc: &mut [i16; HL], col: &[i16; HL]) {
+        use core::arch::aarch64::*;
+        let mut i = 0;
+        while i < HL {
+            let a = vld1q_s16(acc.as_ptr().add(i));
+            let w = vld1q_s16(col.as_ptr().add(i));
+            vst1q_s16(acc.as_mut_ptr().add(i), vaddq_s16(a, w));
+            i += 8;
+        }
+    }
+
+    /// NEON accumulator subtract. See [`acc_add_neon`] for the safety contract.
+    ///
+    /// # Safety
+    /// Same as [`acc_add_neon`].
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn acc_sub_neon(acc: &mut [i16; HL], col: &[i16; HL]) {
+        use core::arch::aarch64::*;
+        let mut i = 0;
+        while i < HL {
+            let a = vld1q_s16(acc.as_ptr().add(i));
+            let w = vld1q_s16(col.as_ptr().add(i));
+            vst1q_s16(acc.as_mut_ptr().add(i), vsubq_s16(a, w));
+            i += 8;
+        }
+    }
+
+    /// NEON output reduction. Clamps to `[0, QA]` in `i16`, then widening-square
+    /// (`vmull_s16`, exact since `c² ≤ QA² = 65025` fits `i32`) and fused multiply-
+    /// accumulate (`vmlaq_s32`) by the widened weight. Four independent `i32`
+    /// accumulators (16 `i16` per iteration) hide the MLA latency — without this ILP
+    /// the kernel loses to LLVM's autovectorised scalar on Apple Silicon; with it the
+    /// forward pass is a few percent faster. Bit-identical (associative `i32`).
+    ///
+    /// # Safety
+    /// NEON is part of the aarch64 baseline, so this is always callable on aarch64.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn forward_neon(us: &[i16; HL], them: &[i16; HL], weights: &[i16; 2 * HL]) -> i32 {
+        use core::arch::aarch64::*;
+
+        // One 8-wide block: clamp in i16, widening-square (`vmull_s16`, exact since
+        // `c² ≤ 65025`), then `+= c²·w` via fused MLA on the widened weight.
+        #[inline]
+        #[target_feature(enable = "neon")]
+        unsafe fn block(
+            lo: int32x4_t,
+            hi: int32x4_t,
+            vals: *const i16,
+            wts: *const i16,
+        ) -> (int32x4_t, int32x4_t) {
+            let zero = vdupq_n_s16(0);
+            let qa = vdupq_n_s16(QA as i16);
+            let c = vminq_s16(vmaxq_s16(vld1q_s16(vals), zero), qa);
+            let w = vld1q_s16(wts);
+            let lo = vmlaq_s32(
+                lo,
+                vmull_s16(vget_low_s16(c), vget_low_s16(c)),
+                vmovl_s16(vget_low_s16(w)),
+            );
+            let hi = vmlaq_s32(hi, vmull_high_s16(c, c), vmovl_high_s16(w));
+            (lo, hi)
+        }
+
+        // Four independent i32 accumulators (16 i16 per iteration) to hide MLA latency.
+        let z = vdupq_n_s32(0);
+        let (mut a0, mut a1, mut b0, mut b1) = (z, z, z, z);
+        for (vals, wts) in
+            [(us.as_ptr(), weights.as_ptr()), (them.as_ptr(), weights.as_ptr().add(HL))]
+        {
+            let mut i = 0;
+            while i < HL {
+                (a0, a1) = block(a0, a1, vals.add(i), wts.add(i));
+                (b0, b1) = block(b0, b1, vals.add(i + 8), wts.add(i + 8));
+                i += 16;
+            }
+        }
+        vaddvq_s32(vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(b0, b1)))
+    }
 }
 
 /// The NNUE evaluator. Zero-sized: the weights live in the [`network`] singleton.
@@ -388,5 +681,64 @@ mod tests {
         }
         assert!(seen.0, "walk never reached an en-passant capture — coverage gap");
         assert!(seen.1, "walk never reached a promotion — coverage gap");
+    }
+
+    /// The SIMD verification (#47). The other tests cannot catch a systematic SIMD
+    /// bug: `incremental_equals_from_scratch_over_perft_walk` compares two paths
+    /// that *both* go through the dispatched (SIMD) `add`, and `matches_verify_oracle`
+    /// pins only eight positions. This walks the full perft-walk tree and at every
+    /// node asserts the dispatched SIMD path is **bit-exact** equal to the always-
+    /// compiled `*_scalar` reference, for BOTH hot loops:
+    ///   * the raw `2 × 256` i16 accumulator (`Accumulator::add` vs `acc_add_scalar`), and
+    ///   * the `Σ screlu·w` reduction (`forward` vs `forward_scalar`).
+    ///
+    /// Only meaningful when the `simd` feature is on (otherwise both sides are the
+    /// scalar path). On real x86 this is where the AVX2 kernel is bit-verified —
+    /// it cannot be *run* on the aarch64 dev host, only in CI. NB: a *panic* here in
+    /// a debug build (rather than an assert failure) would mean an i32 lane overflow
+    /// in the reduction → widen the lanes to i64, not a logic bug.
+    #[cfg(feature = "simd")]
+    fn walk_simd_vs_scalar(board: &mut Board, depth: u32, net: &Network) {
+        // Accumulator: SIMD-built (from_board) vs scalar-built, full raw i16 state.
+        let simd_acc = Accumulator::from_board(board);
+        let mut scalar_vals = [net.feature_bias; 2];
+        let mut occ = board.occupied();
+        while let Some(sq) = occ.pop_lsb() {
+            let piece = board.piece_on(sq).expect("occupied square has a piece");
+            for (p, vals) in scalar_vals.iter_mut().enumerate() {
+                acc_add_scalar(vals, &net.feature_weights[feature_index(p, piece, sq)]);
+            }
+        }
+        assert_eq!(simd_acc.vals, scalar_vals, "SIMD accumulator != scalar reference");
+
+        // Reduction: SIMD `forward` vs `forward_scalar` for this position's bucket.
+        let bucket = output_bucket(board.occupied().count());
+        let weights = &net.output_weights[bucket];
+        let us = &simd_acc.vals[board.side_to_move.index()];
+        let them = &simd_acc.vals[board.side_to_move.flip().index()];
+        assert_eq!(
+            forward(us, them, weights),
+            forward_scalar(us, them, weights),
+            "SIMD forward != scalar"
+        );
+
+        if depth == 0 {
+            return;
+        }
+        for mv in generate_legal(board) {
+            let undo = board.make_move(mv);
+            walk_simd_vs_scalar(board, depth - 1, net);
+            board.unmake_move(mv, undo);
+        }
+    }
+
+    #[cfg(feature = "simd")]
+    #[test]
+    fn simd_matches_scalar_over_perft_walk() {
+        let net = network();
+        for fen in [STARTPOS, KIWIPETE, POS4, POS5] {
+            let mut board = Board::from_str(fen).unwrap();
+            walk_simd_vs_scalar(&mut board, 3, net);
+        }
     }
 }

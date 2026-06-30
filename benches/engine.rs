@@ -30,6 +30,7 @@ use engine::eval::{Evaluator, Material};
 use engine::movegen::{
     bishop_attacks, generate_legal, ray_attacks, rook_attacks, BISHOP_DIRS, ROOK_DIRS,
 };
+use engine::nnue::{evaluate_accumulator, Accumulator};
 use engine::perft::{perft, KIWIPETE, POS3, POS4, STARTPOS};
 use engine::types::Square;
 
@@ -73,6 +74,30 @@ fn bench_eval(c: &mut Criterion) {
     for (name, fen) in [("startpos", STARTPOS), ("kiwipete", KIWIPETE)] {
         let board = board(fen);
         group.bench_function(name, |b| b.iter(|| evaluator.evaluate(black_box(&board))));
+    }
+    group.finish();
+}
+
+/// The NNUE hot paths (#47). Two separate measurements so the SIMD win on each is
+/// visible independently (run with default features vs `--no-default-features` to
+/// compare the SIMD kernels against the scalar fallback):
+///   * `forward/*` — the output reduction (`evaluate_accumulator`) on a prebuilt
+///     accumulator, isolating the SCReLU + affine the search calls at every leaf.
+///   * `accumulator/*` — a full `Accumulator::from_board` (bias + every piece's
+///     column add), the from-scratch refresh cost.
+fn bench_nnue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("nnue");
+    for (name, fen) in [("startpos", STARTPOS), ("kiwipete", KIWIPETE)] {
+        let board = board(fen);
+        let acc = Accumulator::from_board(&board);
+        let stm = board.side_to_move;
+        let pc = board.occupied().count();
+        group.bench_function(format!("forward/{name}"), |b| {
+            b.iter(|| evaluate_accumulator(black_box(&acc), black_box(stm), black_box(pc)))
+        });
+        group.bench_function(format!("accumulator/{name}"), |b| {
+            b.iter(|| Accumulator::from_board(black_box(&board)))
+        });
     }
     group.finish();
 }
@@ -137,5 +162,13 @@ fn bench_sliders(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_perft, bench_movegen, bench_eval, bench_make_unmake, bench_sliders);
+criterion_group!(
+    benches,
+    bench_perft,
+    bench_movegen,
+    bench_eval,
+    bench_nnue,
+    bench_make_unmake,
+    bench_sliders
+);
 criterion_main!(benches);
