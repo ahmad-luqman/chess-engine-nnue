@@ -1,0 +1,13 @@
+[package]
+name = "verify"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-std reference NNUE inference + sanity check (issue #45). No GPU."
+
+[[bin]]
+name = "verify"
+path = "src/main.rs"
+
+# Intentionally zero dependencies: this binary is the CPU inference contract that
+# engine wiring (#46) copies, and must run on any machine (no GPU toolchain).
+[dependencies]

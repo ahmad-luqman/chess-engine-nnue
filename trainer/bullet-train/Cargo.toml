@@ -1,0 +1,30 @@
+[package]
+name = "bullet-train"
+version = "0.1.0"
+edition = "2021"
+description = "bullet trainer for chess-engine-nnue's first NNUE (issue #45)"
+
+[[bin]]
+name = "train"
+path = "src/main.rs"
+
+# Pinned to a specific bullet commit for a reproducible recipe. bullet selects its
+# compute backend via a feature; pick exactly one at build time (metal OR cuda).
+[dependencies.bullet_lib]
+git = "https://github.com/jw1912/bullet"
+rev = "cebc78a093d92cbc87e56cfef049184c225270b0"
+package = "bullet_lib"
+
+# Used only by the `featcheck` bin to cross-validate verify's feature mapping
+# against bullet's own Chess768. Same version bullet_lib pins, so the ChessBoard
+# type unifies.
+[dependencies.bulletformat]
+version = "1.8"
+
+[features]
+# No default backend: the user must choose, so a bare `cargo build` can't silently
+# pick the wrong one. See trainer/README.md.
+default = []
+metal = ["bullet_lib/metal"]
+cuda = ["bullet_lib/cuda"]
+rocm = ["bullet_lib/rocm"]

@@ -1,0 +1,15 @@
+# NNUE trainer workspace for issue #45 — deliberately SEPARATE from the engine
+# crate at the repo root. The engine has zero runtime dependencies and a strict
+# release profile; bullet (heavy, GPU-backed) must never leak into it.
+#
+# Two members:
+#   bullet-train — the bullet trainer (needs a GPU backend feature: metal/cuda).
+#   verify       — pure-std reference inference + sanity check. NO GPU, runs
+#                  anywhere; it is the inference contract that wiring (#46) copies.
+#
+# Run a single member to avoid building the other's deps:
+#   cargo run -r -p bullet-train --features metal
+#   cargo run -r -p verify -- ../nets/chess-engine-nnue-0001.bin
+[workspace]
+members = ["bullet-train", "verify"]
+resolver = "2"

@@ -28,7 +28,17 @@
 /data/*
 !/data/texel_sample.txt
 !/data/nnue_sample.txt
-/nets/
+# Nets are large binaries; ignore the dir's contents but allowlist the committed
+# first net (issue #45). `/nets/*` (not `/nets/`) so git descends to honour the
+# negation, which must come after `*.bin` above — later patterns win.
+/nets/*
+!/nets/chess-engine-nnue-0001.bin
+
+# NNUE trainer (trainer/) build + run artifacts: the bullet build, checkpoints,
+# and downloaded binpacks are all large/regenerable. Keep the source + Cargo.lock.
+/trainer/target/
+/trainer/**/checkpoints/
+/trainer/**/data/
 
 # Match-runner (fastchess/cutechess) artifacts written into the working dir.
 /config.json

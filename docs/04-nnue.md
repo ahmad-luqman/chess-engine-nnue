@@ -16,20 +16,35 @@ columns** from the accumulator instead of recomputing it. That incremental updat
 is what makes a neural eval fast enough to run millions of times per second in an
 alpha-beta search. This is the whole trick.
 
-## Typical architecture (HalfKP / HalfKA-style)
+## Our first architecture: plain `768`-input perspective net
+
+The first net is deliberately **not** HalfKP/HalfKA. The 2026 consensus (bullet
+docs, Viridithas) is to start with the simplest net that beats a tuned HCE and
+add complexity only when SPRT says it gains — a HalfKP net needs far more data and
+king-bucket machinery, and a beginner usually *loses* Elo with it. So:
 
 ```
-sparse features ──► [big linear layer] ──► accumulator (per side)
-   (king-relative)      (incrementally updated)
-                              │
-                        clipped ReLU
-                              │
-                     [small dense layers] ──► scalar eval (centipawns)
+768 one-hot features ──► [768 → 256 linear] ──► accumulator (per side)
+   (piece, square)          (incrementally updated)
+                                  │
+                            SCReLU  (clamp(x,0,1)²)
+                                  │
+   concat(stm, opponent) ──► [512 → 1, ×8 buckets] ──► scalar eval (centipawns)
 ```
 
-- **Perspective**: two accumulators (side-to-move and opponent), concatenated.
-- **Quantization**: weights are `int8`/`int16`; eval uses integer SIMD (AVX2/AVX-512
-  / NEON). No floats at inference. This is why it's CPU-fast.
+- **Inputs**: `768 = 2 colours × 6 pieces × 64 squares`, index `64·piece + square`.
+  King-agnostic — no accumulator refresh on king moves.
+- **Perspective**: two accumulators (side-to-move and opponent), concatenated
+  **stm first**.
+- **Output buckets**: 8, selected by piece count (`(count − 2) / 4`).
+- **Quantization**: weights are `int16` (`QA=255`, `QB=64`, `SCALE=400`); eval uses
+  integer arithmetic (SCReLU squared/accumulated in `int32`). No floats at
+  inference. This is why it's CPU-fast.
+
+The exact architecture, quantisation, net file layout, and inference arithmetic are
+specified in [ADR 0016](decisions/0016-nnue-first-net-architecture.md) — that ADR
+is the contract the inference code (#46) must match. HalfKP/HalfKA remains a
+later, SPRT-gated option.
 
 ## The training pipeline (the loop)
 
@@ -52,10 +67,16 @@ self-play. Our Phase 1–3 hand-crafted eval is therefore not throwaway — it's
 
 ## Tooling
 
-- **bullet** — Rust, CUDA NNUE trainer. Default for new engines; matches a
-  Rust-engine workflow. <https://github.com/jw1912/bullet>
+- **bullet** — Rust NNUE trainer (CUDA, ROCm, **and Metal** backends — so it
+  trains locally on Apple Silicon as well as on a CUDA box). Default for new
+  engines; matches a Rust-engine workflow. <https://github.com/jw1912/bullet>
 - **nnue-pytorch** — Stockfish's PyTorch trainer; best-documented reference for
   the *concepts* and SF's exact format. <https://github.com/official-stockfish/nnue-pytorch>
+
+Our trainer setup and the **reproducible training recipe** (data → train → export
+→ verify, for both Metal and CUDA) live in [`trainer/README.md`](../trainer/README.md).
+`examples/gen_data.rs` already emits bullet's text format for self-play data (#44);
+the bootstrap net is trained on public Stockfish/Leela binpacks.
 
 ## What this means for earlier phases (design with NNUE in mind)
 
