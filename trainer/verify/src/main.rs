@@ -207,6 +207,19 @@ fn main() -> ExitCode {
     let net = Network::load(&bytes);
     println!("loaded {} ({} bytes)", path, bytes.len());
 
+    // Oracle mode: any extra args are FENs to evaluate. Used to generate golden
+    // values pinned in src/nnue.rs tests (verify is the bullet-validated oracle).
+    let extra: Vec<String> = std::env::args().skip(2).collect();
+    if !extra.is_empty() {
+        for fen in &extra {
+            let (pieces, stm) = parse_fen(fen);
+            let count = pieces.len() as i32;
+            let bucket = ((count - 2) / 4).clamp(0, BUCKETS as i32 - 1);
+            println!("eval={:>6} cp  bucket={bucket}  pieces={count}  {fen}", net.evaluate(&pieces, stm));
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // Reference positions. Material deltas are built from startpos so the checks
     // depend only on the mapping, not on how well the net is calibrated.
     const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";

@@ -46,6 +46,17 @@ specified in [ADR 0016](decisions/0016-nnue-first-net-architecture.md) — that 
 is the contract the inference code (#46) must match. HalfKP/HalfKA remains a
 later, SPRT-gated option.
 
+## Inference (`src/nnue.rs`, #46)
+
+The forward pass lives in `src/nnue.rs`, behind the swappable `Evaluator` trait.
+Two accumulators (one per perspective colour) are kept in `i16` and updated
+**incrementally** from the `DirtyPiece` deltas (#43) on make/unmake — adding or
+subtracting a few weight columns instead of recomputing. The committed net is
+embedded with `include_bytes!`. Design decisions (colour-keyed accumulators,
+`DirtyPiece`-driven update, the from-scratch trait seam, and the perft-walk
+correctness guard) are in [ADR 0017](decisions/0017-nnue-inference-incremental-accumulator.md).
+Search still uses the hand-crafted eval; flipping it to NNUE under SPRT is #48.
+
 ## The training pipeline (the loop)
 
 ```

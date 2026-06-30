@@ -10,6 +10,7 @@ pub mod fen;
 pub mod magic;
 pub mod movegen;
 pub mod moves;
+pub mod nnue;
 pub mod perft;
 pub mod search;
 pub mod timeman;
