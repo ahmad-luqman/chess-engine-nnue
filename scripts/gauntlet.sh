@@ -135,8 +135,12 @@ for i in "${!NAMES[@]}"; do
     echo "$out" >> "$LOG"
     cat "$mpgn" >> "$PGN" 2>/dev/null || true; rm -f "$mpgn"
 
-    elo_line="$(grep -m1 '^Elo:' <<<"$out" || true)"
-    pts_line="$(grep -m1 '^Games:' <<<"$out" || true)"
+    # fastchess prints a periodic interim Elo/Games block as the match runs, then a
+    # final cumulative one. Take the LAST of each (not the first): an early report is
+    # a small sample, and if the candidate sweeps the opening games it reads
+    # `Elo: inf` and would be misflagged "no signal" while real signal arrives later.
+    elo_line="$(grep '^Elo:' <<<"$out" | tail -1 || true)"
+    pts_line="$(grep '^Games:' <<<"$out" | tail -1 || true)"
     diff="$(sed -nE 's/^Elo: *([^ ]+) .*/\1/p' <<<"$elo_line")"
     err="$(sed -nE 's/^Elo: [^ ]+ \+\/- ([^,]+).*/\1/p'  <<<"$elo_line")"
     score="$(sed -nE 's/.*\(([0-9.]+) %\).*/\1/p' <<<"$pts_line")"
