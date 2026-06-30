@@ -353,7 +353,13 @@ mod tests {
     /// **bit-exact** equal to the from-scratch accumulator at every node — comparing
     /// the full raw `2 × 256` `i16` state, not just the eval. A sign or index error
     /// in the incremental path (the classic silent Elo bug) breaks this immediately.
-    fn walk(board: &mut Board, depth: u32, acc: &mut Accumulator, net: &Network, seen: &mut (bool, bool)) {
+    fn walk(
+        board: &mut Board,
+        depth: u32,
+        acc: &mut Accumulator,
+        net: &Network,
+        seen: &mut (bool, bool),
+    ) {
         assert_eq!(*acc, Accumulator::from_board(board), "incremental != from-scratch");
         if depth == 0 {
             return;
@@ -373,8 +379,8 @@ mod tests {
     fn incremental_equals_from_scratch_over_perft_walk() {
         let net = network();
         let mut seen = (false, false); // (en-passant, promotion)
-        // Position diversity beats depth: Kiwipete/POS4/POS5 exercise castling,
-        // en-passant, and promotion — the DirtyPiece classes startpos never hits.
+                                       // Position diversity beats depth: Kiwipete/POS4/POS5 exercise castling,
+                                       // en-passant, and promotion — the DirtyPiece classes startpos never hits.
         for fen in [STARTPOS, KIWIPETE, POS4, POS5] {
             let mut board = Board::from_str(fen).unwrap();
             let mut acc = Accumulator::from_board(&board);
