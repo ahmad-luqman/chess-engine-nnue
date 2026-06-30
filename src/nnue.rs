@@ -292,57 +292,90 @@ fn forward_scalar(us: &[i16; HL], them: &[i16; HL], weights: &[i16; 2 * HL]) -> 
     out
 }
 
-/// Add a feature column into one perspective's accumulator (SIMD when available).
+// Dispatchers for the two hot loops. Each is defined three times, one per
+// (feature, arch) cfg, so exactly one compiles per target and every body is a
+// plain tail expression — no cross-target `return`/unreachable lint noise. x86-64
+// picks AVX2 at runtime; aarch64 uses NEON unconditionally (baseline); everything
+// else (and `--no-default-features`) uses the always-compiled scalar reference.
+
+/// Add a feature column into one perspective's accumulator (AVX2 when present).
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[inline]
 fn acc_add(acc: &mut [i16; HL], col: &[i16; HL]) {
-    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx2") {
-            // SAFETY: the runtime check above confirms AVX2 is present.
-            return unsafe { simd::acc_add_avx2(acc, col) };
-        }
-        return acc_add_scalar(acc, col);
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: the runtime check confirms AVX2 is present.
+        unsafe { simd::acc_add_avx2(acc, col) }
+    } else {
+        acc_add_scalar(acc, col)
     }
-    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+}
+
+/// Add a feature column into one perspective's accumulator (NEON, aarch64 baseline).
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[inline]
+fn acc_add(acc: &mut [i16; HL], col: &[i16; HL]) {
     // SAFETY: NEON is part of the aarch64 baseline, so it is always available.
-    return unsafe { simd::acc_add_neon(acc, col) };
-    #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    unsafe { simd::acc_add_neon(acc, col) }
+}
+
+/// Add a feature column into one perspective's accumulator (scalar fallback).
+#[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[inline]
+fn acc_add(acc: &mut [i16; HL], col: &[i16; HL]) {
     acc_add_scalar(acc, col)
 }
 
-/// Subtract a feature column from one perspective's accumulator (SIMD when available).
+/// Subtract a feature column from one perspective's accumulator (AVX2 when present).
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[inline]
 fn acc_sub(acc: &mut [i16; HL], col: &[i16; HL]) {
-    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx2") {
-            // SAFETY: the runtime check above confirms AVX2 is present.
-            return unsafe { simd::acc_sub_avx2(acc, col) };
-        }
-        return acc_sub_scalar(acc, col);
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: the runtime check confirms AVX2 is present.
+        unsafe { simd::acc_sub_avx2(acc, col) }
+    } else {
+        acc_sub_scalar(acc, col)
     }
-    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+}
+
+/// Subtract a feature column from one perspective's accumulator (NEON, aarch64 baseline).
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[inline]
+fn acc_sub(acc: &mut [i16; HL], col: &[i16; HL]) {
     // SAFETY: NEON is part of the aarch64 baseline, so it is always available.
-    return unsafe { simd::acc_sub_neon(acc, col) };
-    #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    unsafe { simd::acc_sub_neon(acc, col) }
+}
+
+/// Subtract a feature column from one perspective's accumulator (scalar fallback).
+#[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[inline]
+fn acc_sub(acc: &mut [i16; HL], col: &[i16; HL]) {
     acc_sub_scalar(acc, col)
 }
 
-/// The output reduction `Σ screlu(acc)·w` (SIMD when available).
+/// The output reduction `Σ screlu(acc)·w` (AVX2 when present).
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[inline]
 fn forward(us: &[i16; HL], them: &[i16; HL], weights: &[i16; 2 * HL]) -> i32 {
-    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx2") {
-            // SAFETY: the runtime check above confirms AVX2 is present.
-            return unsafe { simd::forward_avx2(us, them, weights) };
-        }
-        return forward_scalar(us, them, weights);
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: the runtime check confirms AVX2 is present.
+        unsafe { simd::forward_avx2(us, them, weights) }
+    } else {
+        forward_scalar(us, them, weights)
     }
-    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+}
+
+/// The output reduction `Σ screlu(acc)·w` (NEON, aarch64 baseline).
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[inline]
+fn forward(us: &[i16; HL], them: &[i16; HL], weights: &[i16; 2 * HL]) -> i32 {
     // SAFETY: NEON is part of the aarch64 baseline, so it is always available.
-    return unsafe { simd::forward_neon(us, them, weights) };
-    #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    unsafe { simd::forward_neon(us, them, weights) }
+}
+
+/// The output reduction `Σ screlu(acc)·w` (scalar fallback).
+#[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[inline]
+fn forward(us: &[i16; HL], them: &[i16; HL], weights: &[i16; 2 * HL]) -> i32 {
     forward_scalar(us, them, weights)
 }
 
